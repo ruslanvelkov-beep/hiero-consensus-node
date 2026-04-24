@@ -16,6 +16,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.function.Consumer;
 import org.hiero.base.utility.MemoryUtils;
 
@@ -46,18 +49,13 @@ public final class DataFileWriter {
     private static final String ERROR_DATA_ITEM_TOO_LARGE =
             "Data item is too large to write to a data file. Increase data file mapped byte buffer size";
 
-    /**
-     * The current mapped byte buffer used for writing. When overflowed, it is released, and another
-     * buffer is mapped from the file channel.
-     */
-    private MappedByteBuffer mappedDataBuffer;
+    private final AtomicReferenceArray<WritingWindow> writingWindows =
+            new AtomicReferenceArray<>((int) ((1L << 40) / DEFAULT_BUF_SIZE));
 
     /**
      * Offset, in bytes, of the current mapped byte buffer in the file channel.
      */
-    private long bufferPositionInFile;
-
-    private BufferedData dataBuffer;
+    private final AtomicLong currentWriteOffset = new AtomicLong(0);
 
     /** The path to the data file we are writing */
     private final Path path;
@@ -71,6 +69,9 @@ public final class DataFileWriter {
     private long itemsCount = 0;
 
     private final long dataBufferSize;
+    private final long halfBufferSize;
+
+    private final long headerSize;
 
     /**
      * Indicates if this file writer has been closed. Only set and accessed on the
@@ -112,6 +113,7 @@ public final class DataFileWriter {
             final long dataBufferSize)
             throws IOException {
         this.dataBufferSize = dataBufferSize;
+        this.halfBufferSize = dataBufferSize / 2;
 
         path = createDataFilePath(
                 filePrefix, dataFileDir, index, creationTime, compactionLevel, DataFileCommon.FILE_EXTENSION);
@@ -119,25 +121,8 @@ public final class DataFileWriter {
         fileChannel = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
         metadata = new DataFileMetadata(index, creationTime, compactionLevel, itemsCount);
 
-        bufferPositionInFile = writeHeader();
-        moveWritingBuffer(bufferPositionInFile);
-    }
-
-    /**
-     * Maps the writing byte buffer to the given position in the file. Byte buffer size is always
-     * {@link #dataBufferSize}. Previous mapped byte buffer, if not null, is released.
-     *
-     * @param startPosition new mapped byte buffer position in the file, in bytes
-     * @throws IOException if I/O error(s) occurred
-     */
-    private void moveWritingBuffer(final long startPosition) throws IOException {
-        final MappedByteBuffer newBuffer = fileChannel.map(MapMode.READ_WRITE, startPosition, dataBufferSize);
-        if (mappedDataBuffer != null) {
-            MemoryUtils.closeMmapBuffer(mappedDataBuffer);
-        }
-        bufferPositionInFile = startPosition;
-        mappedDataBuffer = newBuffer;
-        dataBuffer = BufferedData.wrap(mappedDataBuffer);
+        headerSize = writeHeader();
+        currentWriteOffset.set(headerSize);
     }
 
     private long writeHeader() throws IOException {
@@ -181,6 +166,21 @@ public final class DataFileWriter {
         return storeDataItem(o -> o.writeBytes(dataItem), Math.toIntExact(dataItem.remaining()));
     }
 
+    private WritingWindow getWritingWindow(final int writingIndex) throws IOException {
+        WritingWindow writingWindow = writingWindows.get(writingIndex);
+        if (writingWindow == null) {
+            synchronized (this) {
+                writingWindow = writingWindows.get(writingIndex);
+                if (writingWindow == null) {
+                    writingWindow = new WritingWindow(writingIndex * halfBufferSize);
+                    writingWindows.set(writingIndex, writingWindow);
+                }
+            }
+        }
+        writingWindow.retain();
+        return writingWindow;
+    }
+
     /**
      * Store a data item in file returning location it was stored at. The data item is written
      * with the {@link DataFileCommon#FIELD_DATAFILE_ITEMS} tag.
@@ -195,27 +195,35 @@ public final class DataFileWriter {
             throw new IOException("Data file is already closed");
         }
 
-        final long fileOffset = getCurrentFilePosition();
         final int sizeToWrite = ProtoWriterTools.sizeOfDelimited(FIELD_DATAFILE_ITEMS, dataItemSize);
-
-        if (sizeToWrite > dataBufferSize) {
+        if (sizeToWrite > halfBufferSize) {
             throw new IOException(
-                    ERROR_DATA_ITEM_TOO_LARGE + " dataSize=" + sizeToWrite + ", bufferSize=" + dataBufferSize);
+                    ERROR_DATA_ITEM_TOO_LARGE + " dataSize=" + sizeToWrite + ", bufferSize=" + halfBufferSize);
         }
 
-        // if there is not enough space in the current mapped buffer,
-        // we need to move it to start at the current file offset
-        if (dataBuffer.remaining() < sizeToWrite) {
-            moveWritingBuffer(fileOffset);
-        }
+        final long fileOffset = currentWriteOffset.getAndAdd(sizeToWrite);
+        final int writingIndex = (int) (fileOffset / halfBufferSize);
 
-        // write actual data
-        ProtoWriterTools.writeDelimited(dataBuffer, FIELD_DATAFILE_ITEMS, dataItemSize, dataItemWriter);
+        final WritingWindow writingWindow = getWritingWindow(writingIndex);
+        try {
+            final long writingOffset = fileOffset % halfBufferSize;
+//            final BufferedData writeBuffer = writingWindow.writeBuffer.slice(writingOffset, sizeToWrite);
+//            ProtoWriterTools.writeDelimited(writeBuffer, FIELD_DATAFILE_ITEMS, dataItemSize, dataItemWriter);
+            final byte[] writeBytes = new byte[sizeToWrite];
+            final BufferedData writeBuffer = BufferedData.wrap(writeBytes);
+            ProtoWriterTools.writeDelimited(writeBuffer, FIELD_DATAFILE_ITEMS, dataItemSize, dataItemWriter);
+            writingWindow.mappedBuffer.put((int) writingOffset, writeBytes);
 
-        // double check that we wrote the expected number of bytes
-        if (getCurrentFilePosition() != fileOffset + sizeToWrite) {
-            throw new IOException("Estimated size / written bytes mismatch: expected=" + sizeToWrite + " written="
-                    + (getCurrentFilePosition() - fileOffset));
+            // double check that we wrote the expected number of bytes
+            if (writeBuffer.remaining() != 0) {
+                throw new IOException("Estimated size / written bytes mismatch: expected=" + sizeToWrite + " written="
+                        + (sizeToWrite - writeBuffer.remaining()));
+            }
+        } finally {
+            writingWindow.release();
+            if ((fileOffset / halfBufferSize) != ((fileOffset + sizeToWrite) / halfBufferSize)) {
+                writingWindow.release();
+            }
         }
 
         itemsCount++;
@@ -240,27 +248,32 @@ public final class DataFileWriter {
             throw new IOException("Data file is already closed");
         }
 
-        final long fileOffset = getCurrentFilePosition();
         final int sizeToWrite = Math.toIntExact(dataItemWithTag.remaining());
-
-        if (sizeToWrite > dataBufferSize) {
+        if (sizeToWrite > halfBufferSize) {
             throw new IOException(
-                    ERROR_DATA_ITEM_TOO_LARGE + " dataSize=" + sizeToWrite + ", bufferSize=" + dataBufferSize);
+                    ERROR_DATA_ITEM_TOO_LARGE + " dataSize=" + sizeToWrite + ", bufferSize=" + halfBufferSize);
         }
 
-        // if there is not enough space in the current mapped buffer,
-        // we need to move it to start at the current file offset
-        if (dataBuffer.remaining() < sizeToWrite) {
-            moveWritingBuffer(fileOffset);
-        }
+        final long fileOffset = currentWriteOffset.getAndAdd(sizeToWrite);
+        final int writingIndex = (int) (fileOffset / halfBufferSize);
 
-        // write actual data
-        dataBuffer.writeBytes(dataItemWithTag);
+        final WritingWindow writingWindow = getWritingWindow(writingIndex);
+        try {
+            final long writingOffset = fileOffset % halfBufferSize;
+            final BufferedData writeBuffer = writingWindow.writeBuffer.slice(writingOffset, sizeToWrite);
+            // write actual data
+            writeBuffer.writeBytes(dataItemWithTag);
 
-        // double check that we wrote the expected number of bytes
-        if (getCurrentFilePosition() != fileOffset + sizeToWrite) {
-            throw new IOException("Estimated size / written bytes mismatch: expected=" + sizeToWrite + " written="
-                    + (getCurrentFilePosition() - fileOffset));
+            // double check that we wrote the expected number of bytes
+            if (writeBuffer.remaining() != 0) {
+                throw new IOException("Estimated size / written bytes mismatch: expected=" + sizeToWrite + " written="
+                        + (sizeToWrite - writeBuffer.remaining()));
+            }
+        } finally {
+            writingWindow.release();
+            if ((fileOffset / halfBufferSize) != ((fileOffset + sizeToWrite) / halfBufferSize)) {
+                writingWindow.release();
+            }
         }
 
         itemsCount++;
@@ -278,10 +291,15 @@ public final class DataFileWriter {
         closed = true;
 
         // total file size is where the current writing pos is
-        final long totalFileSize = bufferPositionInFile + dataBuffer.position();
+        final long totalFileSize = currentWriteOffset.get();
 
-        // release all the resources
-        MemoryUtils.closeMmapBuffer(mappedDataBuffer);
+        if (totalFileSize > headerSize) {
+            // release all the resources
+            final int lastWritingIndex = (int) (totalFileSize / halfBufferSize);
+            final WritingWindow lastWritingWindow = writingWindows.get(lastWritingIndex);
+            assert lastWritingWindow != null;
+            lastWritingWindow.release();
+        }
 
         // Update metadata with the final items count and rewrite the header.
         // The header size is identical to the original because FIELD_ITEMS_COUNT
@@ -299,7 +317,28 @@ public final class DataFileWriter {
         fileChannel.close();
     }
 
-    private long getCurrentFilePosition() {
-        return bufferPositionInFile + dataBuffer.position();
+    private class WritingWindow {
+
+        private final AtomicInteger refCount = new AtomicInteger(1);
+        public final MappedByteBuffer mappedBuffer;
+        public final BufferedData writeBuffer;
+
+        public WritingWindow(final long fileOffset) throws IOException {
+            assert fileOffset % halfBufferSize == 0;
+            mappedBuffer = fileChannel.map(MapMode.READ_WRITE, fileOffset, dataBufferSize);
+            writeBuffer = BufferedData.wrap(mappedBuffer);
+        }
+
+        public void retain() {
+            assert refCount.get() > 0;
+            refCount.incrementAndGet();
+        }
+
+        public void release() {
+            assert refCount.get() > 0;
+            if (refCount.decrementAndGet() == 0) {
+                MemoryUtils.closeMmapBuffer(mappedBuffer);
+            }
+        }
     }
 }
