@@ -9,6 +9,8 @@ import static com.swirlds.merkledb.files.DataFileCommon.createDataFilePath;
 import com.hedera.pbj.runtime.ProtoWriterTools;
 import com.hedera.pbj.runtime.io.buffer.BufferedData;
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileChannel.MapMode;
@@ -48,6 +50,9 @@ public final class DataFileWriter {
 
     private static final String ERROR_DATA_ITEM_TOO_LARGE =
             "Data item is too large to write to a data file. Increase data file mapped byte buffer size";
+
+    private static final ThreadLocal<ByteBuffer> BUFFER_CACHE = new ThreadLocal<>();
+    private static final ThreadLocal<BufferedData> WRITER_CACHE = new ThreadLocal<>();
 
     private final AtomicReferenceArray<WritingWindow> writingWindows =
             new AtomicReferenceArray<>((int) ((1L << 40) / DEFAULT_BUF_SIZE));
@@ -166,19 +171,14 @@ public final class DataFileWriter {
         return storeDataItem(o -> o.writeBytes(dataItem), Math.toIntExact(dataItem.remaining()));
     }
 
-    private WritingWindow getWritingWindow(final int writingIndex) throws IOException {
+    private void prepareWritingWindow(final long offset) throws IOException {
+        final int writingIndex = (int) (offset / halfBufferSize);
         WritingWindow writingWindow = writingWindows.get(writingIndex);
         if (writingWindow == null) {
-            synchronized (this) {
-                writingWindow = writingWindows.get(writingIndex);
-                if (writingWindow == null) {
-                    writingWindow = new WritingWindow(writingIndex * halfBufferSize);
-                    writingWindows.set(writingIndex, writingWindow);
-                }
-            }
+            writingWindow = new WritingWindow(writingIndex * halfBufferSize);
+            writingWindows.set(writingIndex, writingWindow);
         }
         writingWindow.retain();
-        return writingWindow;
     }
 
     /**
@@ -201,23 +201,49 @@ public final class DataFileWriter {
                     ERROR_DATA_ITEM_TOO_LARGE + " dataSize=" + sizeToWrite + ", bufferSize=" + halfBufferSize);
         }
 
-        final long fileOffset = currentWriteOffset.getAndAdd(sizeToWrite);
+        final long fileOffset = currentWriteOffset.getAndUpdate(cur -> {
+            try {
+                prepareWritingWindow(cur);
+                return cur + sizeToWrite;
+            } catch (final IOException z) {
+                throw new UncheckedIOException(z);
+            }
+        });
         final int writingIndex = (int) (fileOffset / halfBufferSize);
+        final WritingWindow writingWindow = writingWindows.get(writingIndex);
+        assert writingWindow != null;
+        assert writingWindow.refCount.get() > 0;
 
-        final WritingWindow writingWindow = getWritingWindow(writingIndex);
         try {
             final long writingOffset = fileOffset % halfBufferSize;
-//            final BufferedData writeBuffer = writingWindow.writeBuffer.slice(writingOffset, sizeToWrite);
-//            ProtoWriterTools.writeDelimited(writeBuffer, FIELD_DATAFILE_ITEMS, dataItemSize, dataItemWriter);
-            final byte[] writeBytes = new byte[sizeToWrite];
-            final BufferedData writeBuffer = BufferedData.wrap(writeBytes);
-            ProtoWriterTools.writeDelimited(writeBuffer, FIELD_DATAFILE_ITEMS, dataItemSize, dataItemWriter);
-            writingWindow.mappedBuffer.put((int) writingOffset, writeBytes);
+
+//            final BufferedData writeBuf = writingWindow.writeBuffer.slice(writingOffset, sizeToWrite);
+//            ProtoWriterTools.writeDelimited(writeBuf, FIELD_DATAFILE_ITEMS, dataItemSize, dataItemWriter);
+
+//            final byte[] writeBytes = new byte[sizeToWrite];
+//            final BufferedData writeBuf = BufferedData.wrap(writeBytes);
+//            ProtoWriterTools.writeDelimited(writeBuf, FIELD_DATAFILE_ITEMS, dataItemSize, dataItemWriter);
+//            writingWindow.mappedBuffer.put((int) writingOffset, writeBytes);
+
+            ByteBuffer writeBB = BUFFER_CACHE.get();
+            final BufferedData writeBuf;
+            if ((writeBB == null) || (writeBB.capacity() < sizeToWrite)) {
+                writeBB = ByteBuffer.allocate(sizeToWrite);
+                BUFFER_CACHE.set(writeBB);
+                writeBuf = BufferedData.wrap(writeBB);
+                WRITER_CACHE.set(writeBuf);
+            } else {
+                writeBuf = WRITER_CACHE.get();
+            }
+            writeBuf.position(0);
+            writeBuf.limit(sizeToWrite);
+            ProtoWriterTools.writeDelimited(writeBuf, FIELD_DATAFILE_ITEMS, dataItemSize, dataItemWriter);
+            writingWindow.mappedBuffer.put((int) writingOffset, writeBB, 0, sizeToWrite);
 
             // double check that we wrote the expected number of bytes
-            if (writeBuffer.remaining() != 0) {
+            if (writeBuf.remaining() != 0) {
                 throw new IOException("Estimated size / written bytes mismatch: expected=" + sizeToWrite + " written="
-                        + (sizeToWrite - writeBuffer.remaining()));
+                        + (sizeToWrite - writeBuf.remaining()));
             }
         } finally {
             writingWindow.release();
@@ -254,14 +280,22 @@ public final class DataFileWriter {
                     ERROR_DATA_ITEM_TOO_LARGE + " dataSize=" + sizeToWrite + ", bufferSize=" + halfBufferSize);
         }
 
-        final long fileOffset = currentWriteOffset.getAndAdd(sizeToWrite);
+        final long fileOffset = currentWriteOffset.getAndUpdate(cur -> {
+            try {
+                prepareWritingWindow(cur);
+                return cur + sizeToWrite;
+            } catch (final IOException z) {
+                throw new UncheckedIOException(z);
+            }
+        });
         final int writingIndex = (int) (fileOffset / halfBufferSize);
+        final WritingWindow writingWindow = writingWindows.get(writingIndex);
+        assert writingWindow != null;
+        assert writingWindow.refCount.get() > 0;
 
-        final WritingWindow writingWindow = getWritingWindow(writingIndex);
         try {
             final long writingOffset = fileOffset % halfBufferSize;
             final BufferedData writeBuffer = writingWindow.writeBuffer.slice(writingOffset, sizeToWrite);
-            // write actual data
             writeBuffer.writeBytes(dataItemWithTag);
 
             // double check that we wrote the expected number of bytes
@@ -297,8 +331,9 @@ public final class DataFileWriter {
             // release all the resources
             final int lastWritingIndex = (int) (totalFileSize / halfBufferSize);
             final WritingWindow lastWritingWindow = writingWindows.get(lastWritingIndex);
-            assert lastWritingWindow != null;
-            lastWritingWindow.release();
+            if (lastWritingWindow != null) {
+                lastWritingWindow.release();
+            }
         }
 
         // Update metadata with the final items count and rewrite the header.
