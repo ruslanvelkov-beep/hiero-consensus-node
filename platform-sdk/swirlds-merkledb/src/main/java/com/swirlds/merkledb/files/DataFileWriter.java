@@ -171,7 +171,7 @@ public final class DataFileWriter {
         return storeDataItem(o -> o.writeBytes(dataItem), Math.toIntExact(dataItem.remaining()));
     }
 
-    private void prepareWritingWindow(final long offset) throws IOException {
+    private WritingWindow prepareWritingWindow(final long offset) throws IOException {
         final int writingIndex = (int) (offset / halfBufferSize);
         WritingWindow writingWindow = writingWindows.get(writingIndex);
         if (writingWindow == null) {
@@ -179,6 +179,7 @@ public final class DataFileWriter {
             writingWindows.set(writingIndex, writingWindow);
         }
         writingWindow.retain();
+        return writingWindow;
     }
 
     /**
@@ -201,17 +202,12 @@ public final class DataFileWriter {
                     ERROR_DATA_ITEM_TOO_LARGE + " dataSize=" + sizeToWrite + ", bufferSize=" + halfBufferSize);
         }
 
-        final long fileOffset = currentWriteOffset.getAndUpdate(cur -> {
-            try {
-                prepareWritingWindow(cur);
-                return cur + sizeToWrite;
-            } catch (final IOException z) {
-                throw new UncheckedIOException(z);
-            }
-        });
-        final int writingIndex = (int) (fileOffset / halfBufferSize);
-        final WritingWindow writingWindow = writingWindows.get(writingIndex);
-        assert writingWindow != null;
+        final WritingWindow writingWindow;
+        final long fileOffset;
+        synchronized (this) {
+            fileOffset = currentWriteOffset.getAndAdd(sizeToWrite);
+            writingWindow = prepareWritingWindow(fileOffset);
+        }
         assert writingWindow.refCount.get() > 0;
 
         try {
@@ -280,17 +276,12 @@ public final class DataFileWriter {
                     ERROR_DATA_ITEM_TOO_LARGE + " dataSize=" + sizeToWrite + ", bufferSize=" + halfBufferSize);
         }
 
-        final long fileOffset = currentWriteOffset.getAndUpdate(cur -> {
-            try {
-                prepareWritingWindow(cur);
-                return cur + sizeToWrite;
-            } catch (final IOException z) {
-                throw new UncheckedIOException(z);
-            }
-        });
-        final int writingIndex = (int) (fileOffset / halfBufferSize);
-        final WritingWindow writingWindow = writingWindows.get(writingIndex);
-        assert writingWindow != null;
+        final WritingWindow writingWindow;
+        final long fileOffset;
+        synchronized (this) {
+            fileOffset = currentWriteOffset.getAndAdd(sizeToWrite);
+            writingWindow = prepareWritingWindow(fileOffset);
+        }
         assert writingWindow.refCount.get() > 0;
 
         try {
@@ -335,6 +326,10 @@ public final class DataFileWriter {
                 lastWritingWindow.release();
             }
         }
+
+//        for (int i = 0; i < writingWindows.length(); i++) {
+//            assert (writingWindows.get(i) == null) || (writingWindows.get(i).refCount.get() == 0);
+//        }
 
         // Update metadata with the final items count and rewrite the header.
         // The header size is identical to the original because FIELD_ITEMS_COUNT
