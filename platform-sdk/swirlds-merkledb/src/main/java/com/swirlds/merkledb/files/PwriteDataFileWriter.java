@@ -105,7 +105,7 @@ public final class PwriteDataFileWriter extends DataFileWriter {
         ByteBuffer writeBytes = BUFFER_CACHE.get();
         final BufferedData writeBuffer;
         if ((writeBytes == null) || (writeBytes.capacity() < sizeToWrite)) {
-            writeBytes = ByteBuffer.allocateDirect(sizeToWrite);
+            writeBytes = ByteBuffer.allocate(sizeToWrite);
             BUFFER_CACHE.set(writeBytes);
             writeBuffer = BufferedData.wrap(writeBytes);
             WRITER_CACHE.set(writeBuffer);
