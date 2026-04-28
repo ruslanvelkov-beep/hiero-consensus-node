@@ -8,16 +8,17 @@ import static com.swirlds.merkledb.files.DataFileCommon.createDataFilePath;
 
 import com.hedera.pbj.runtime.ProtoWriterTools;
 import com.hedera.pbj.runtime.io.buffer.BufferedData;
+import com.swirlds.merkledb.utilities.MerkleDbFileUtils;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.channels.FileChannel.MapMode;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
-import org.hiero.base.utility.MemoryUtils;
 
 /**
  * Class for creating and sequentially writing to the file. A data file contains a header
@@ -36,41 +37,28 @@ import org.hiero.base.utility.MemoryUtils;
  *
  * <p>{@link DataFileReader} or {@link DataFileIterator} can be used to read file back and access data items.
  */
-public final class DataFileWriter {
+public abstract sealed class DataFileWriter permits MmapDataFileWriter, PwriteDataFileWriter {
 
     /**
      * Default buffer size for writing into the file is 64 Mb
      */
-    private static final int DEFAULT_BUF_SIZE = PAGE_SIZE * KIBIBYTES_TO_BYTES * 16;
+    public static final int DEFAULT_BUF_SIZE = PAGE_SIZE * KIBIBYTES_TO_BYTES * 16;
 
-    private static final String ERROR_DATA_ITEM_TOO_LARGE =
-            "Data item is too large to write to a data file. Increase data file mapped byte buffer size";
-
-    /**
-     * The current mapped byte buffer used for writing. When overflowed, it is released, and another
-     * buffer is mapped from the file channel.
-     */
-    private MappedByteBuffer mappedDataBuffer;
-
-    /**
-     * Offset, in bytes, of the current mapped byte buffer in the file channel.
-     */
-    private long bufferPositionInFile;
-
-    private BufferedData dataBuffer;
+    private static final ThreadLocal<ByteBuffer> BUFFER_CACHE = new ThreadLocal<>();
+    private static final ThreadLocal<BufferedData> WRITER_CACHE = new ThreadLocal<>();
 
     /** The path to the data file we are writing */
     private final Path path;
 
-    private final FileChannel fileChannel;
+    protected static final int FC_COUNT = 8;
+
+    protected final FileChannel fileChannel;
 
     /** File metadata */
-    private DataFileMetadata metadata;
+    protected DataFileMetadata metadata;
 
     /** Total number of items written to this file */
-    private long itemsCount = 0;
-
-    private final long dataBufferSize;
+    protected long itemsCount = 0;
 
     /**
      * Indicates if this file writer has been closed. Only set and accessed on the
@@ -81,7 +69,7 @@ public final class DataFileWriter {
     /**
      * Create a new data file with moving mapped byte buffer of 256Mb size.
      */
-    public DataFileWriter(
+    protected DataFileWriter(
             final String filePrefix,
             final Path dataFileDir,
             final int index,
@@ -103,7 +91,7 @@ public final class DataFileWriter {
      * @param compactionLevel the compaction level for this file
      * @param dataBufferSize the size of the memory mapped data buffer to use for writing data items
      */
-    public DataFileWriter(
+    protected DataFileWriter(
             final String filePrefix,
             final Path dataFileDir,
             final int index,
@@ -111,44 +99,23 @@ public final class DataFileWriter {
             final int compactionLevel,
             final long dataBufferSize)
             throws IOException {
-        this.dataBufferSize = dataBufferSize;
-
         path = createDataFilePath(
                 filePrefix, dataFileDir, index, creationTime, compactionLevel, DataFileCommon.FILE_EXTENSION);
         Files.createFile(path);
         fileChannel = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
         metadata = new DataFileMetadata(index, creationTime, compactionLevel, itemsCount);
-
-        bufferPositionInFile = writeHeader();
-        moveWritingBuffer(bufferPositionInFile);
     }
 
-    /**
-     * Maps the writing byte buffer to the given position in the file. Byte buffer size is always
-     * {@link #dataBufferSize}. Previous mapped byte buffer, if not null, is released.
-     *
-     * @param startPosition new mapped byte buffer position in the file, in bytes
-     * @throws IOException if I/O error(s) occurred
-     */
-    private void moveWritingBuffer(final long startPosition) throws IOException {
-        final MappedByteBuffer newBuffer = fileChannel.map(MapMode.READ_WRITE, startPosition, dataBufferSize);
-        if (mappedDataBuffer != null) {
-            MemoryUtils.closeMmapBuffer(mappedDataBuffer);
-        }
-        bufferPositionInFile = startPosition;
-        mappedDataBuffer = newBuffer;
-        dataBuffer = BufferedData.wrap(mappedDataBuffer);
-    }
-
-    private long writeHeader() throws IOException {
-        final MappedByteBuffer headerMappedBuffer = fileChannel.map(MapMode.READ_WRITE, 0, 1024);
-        final BufferedData headerBuffer = BufferedData.wrap(headerMappedBuffer);
-        try {
-            metadata.writeTo(headerBuffer);
-            return headerBuffer.position();
-        } finally {
-            MemoryUtils.closeMmapBuffer(headerMappedBuffer);
-        }
+    protected long writeHeader() throws IOException {
+        final int metadataSize = metadata.metadataSizeInBytes();
+        final ByteBuffer writeBytes = ByteBuffer.allocate(metadataSize);
+        final BufferedData writeBuffer = BufferedData.wrap(writeBytes);
+        metadata.writeTo(writeBuffer);
+        writeBuffer.flip();
+        fileChannel.position(0);
+        MerkleDbFileUtils.completelyWrite(fileChannel, writeBytes);
+        assert fileChannel.position() == metadataSize;
+        return metadataSize;
     }
 
     /**
@@ -194,34 +161,14 @@ public final class DataFileWriter {
         if (closed) {
             throw new IOException("Data file is already closed");
         }
-
-        final long fileOffset = getCurrentFilePosition();
-        final int sizeToWrite = ProtoWriterTools.sizeOfDelimited(FIELD_DATAFILE_ITEMS, dataItemSize);
-
-        if (sizeToWrite > dataBufferSize) {
-            throw new IOException(
-                    ERROR_DATA_ITEM_TOO_LARGE + " dataSize=" + sizeToWrite + ", bufferSize=" + dataBufferSize);
-        }
-
-        // if there is not enough space in the current mapped buffer,
-        // we need to move it to start at the current file offset
-        if (dataBuffer.remaining() < sizeToWrite) {
-            moveWritingBuffer(fileOffset);
-        }
-
-        // write actual data
-        ProtoWriterTools.writeDelimited(dataBuffer, FIELD_DATAFILE_ITEMS, dataItemSize, dataItemWriter);
-
-        // double check that we wrote the expected number of bytes
-        if (getCurrentFilePosition() != fileOffset + sizeToWrite) {
-            throw new IOException("Estimated size / written bytes mismatch: expected=" + sizeToWrite + " written="
-                    + (getCurrentFilePosition() - fileOffset));
-        }
-
+        final long fileOffset = storeDataItemImpl(dataItemWriter, dataItemSize);
         itemsCount++;
         // return the offset where we wrote the data
         return DataFileCommon.dataLocation(metadata.getIndex(), fileOffset);
     }
+
+    protected abstract long storeDataItemImpl(final Consumer<BufferedData> dataItemWriter, final int dataItemSize)
+        throws IOException;
 
     /**
      * Store a data item in file returning location it was stored at. The data item is written
@@ -239,34 +186,15 @@ public final class DataFileWriter {
         if (closed) {
             throw new IOException("Data file is already closed");
         }
-
-        final long fileOffset = getCurrentFilePosition();
-        final int sizeToWrite = Math.toIntExact(dataItemWithTag.remaining());
-
-        if (sizeToWrite > dataBufferSize) {
-            throw new IOException(
-                    ERROR_DATA_ITEM_TOO_LARGE + " dataSize=" + sizeToWrite + ", bufferSize=" + dataBufferSize);
-        }
-
-        // if there is not enough space in the current mapped buffer,
-        // we need to move it to start at the current file offset
-        if (dataBuffer.remaining() < sizeToWrite) {
-            moveWritingBuffer(fileOffset);
-        }
-
-        // write actual data
-        dataBuffer.writeBytes(dataItemWithTag);
-
-        // double check that we wrote the expected number of bytes
-        if (getCurrentFilePosition() != fileOffset + sizeToWrite) {
-            throw new IOException("Estimated size / written bytes mismatch: expected=" + sizeToWrite + " written="
-                    + (getCurrentFilePosition() - fileOffset));
-        }
-
+        final long fileOffset = storeDataItemWithTagImpl(dataItemWithTag);
         itemsCount++;
         // return the offset where we wrote the data
         return DataFileCommon.dataLocation(metadata.getIndex(), fileOffset);
     }
+
+    protected abstract long storeDataItemWithTagImpl(final BufferedData dataItemWithTag) throws IOException;
+
+    protected abstract long getFinalFileSize();
 
     /**
      * Release all the resources like mapped buffer and file channel.
@@ -278,10 +206,7 @@ public final class DataFileWriter {
         closed = true;
 
         // total file size is where the current writing pos is
-        final long totalFileSize = bufferPositionInFile + dataBuffer.position();
-
-        // release all the resources
-        MemoryUtils.closeMmapBuffer(mappedDataBuffer);
+        final long totalFileSize = getFinalFileSize();
 
         // Update metadata with the final items count and rewrite the header.
         // The header size is identical to the original because FIELD_ITEMS_COUNT
@@ -297,9 +222,5 @@ public final class DataFileWriter {
         fileChannel.truncate(totalFileSize);
 
         fileChannel.close();
-    }
-
-    private long getCurrentFilePosition() {
-        return bufferPositionInFile + dataBuffer.position();
     }
 }

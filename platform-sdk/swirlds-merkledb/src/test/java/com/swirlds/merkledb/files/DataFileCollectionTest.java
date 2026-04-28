@@ -312,6 +312,7 @@ class DataFileCollectionTest {
                             tempFileDir.resolve(testType.name()),
                             "test",
                             null,
+                            false,
                             testCallback,
                             l -> new SlowImmutableIndexedObjectListUsingArray<>(DataFileReader[]::new, l));
                     fileCollectionMap.put(testType, reopenedFileCollection);

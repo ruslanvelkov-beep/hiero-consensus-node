@@ -118,6 +118,8 @@ public class DataFileCollection implements FileStatisticAware, Snapshotable {
     /** The range of valid data item keys for data currently stored by this data file collection. */
     private volatile KeyRange validKeyRange = INVALID_KEY_RANGE;
 
+    private final boolean parallel;
+
     /**
      * The list of current files in this data file collection. The files are added to this list
      * during flushes in {@link #endWriting()}, after the file is completely written. They
@@ -178,6 +180,7 @@ public class DataFileCollection implements FileStatisticAware, Snapshotable {
                 storeDir,
                 storeName,
                 null,
+                false,
                 loadedDataCallback,
                 l -> new ImmutableIndexedObjectListUsingArray<>(DataFileReader[]::new, l));
     }
@@ -210,6 +213,25 @@ public class DataFileCollection implements FileStatisticAware, Snapshotable {
                 storeDir,
                 storeName,
                 legacyStoreName,
+                false,
+                loadedDataCallback,
+                l -> new ImmutableIndexedObjectListUsingArray<>(DataFileReader[]::new, l));
+    }
+
+    public DataFileCollection(
+            final MerkleDbConfig dbConfig,
+            final Path storeDir,
+            final String storeName,
+            final String legacyStoreName,
+            final boolean parallel,
+            final LoadedDataCallback loadedDataCallback)
+            throws IOException {
+        this(
+                dbConfig,
+                storeDir,
+                storeName,
+                legacyStoreName,
+                parallel,
                 loadedDataCallback,
                 l -> new ImmutableIndexedObjectListUsingArray<>(DataFileReader[]::new, l));
     }
@@ -238,6 +260,7 @@ public class DataFileCollection implements FileStatisticAware, Snapshotable {
             final Path storeDir,
             final String storeName,
             final String legacyStoreName,
+            final boolean parallel,
             final LoadedDataCallback loadedDataCallback,
             final Function<List<DataFileReader>, ImmutableIndexedObjectList<DataFileReader>>
                     indexedObjectListConstructor)
@@ -246,6 +269,7 @@ public class DataFileCollection implements FileStatisticAware, Snapshotable {
         this.storeDir = storeDir;
         this.storeName = storeName;
         this.legacyStoreName = legacyStoreName;
+        this.parallel = parallel;
         this.indexedObjectListConstructor = indexedObjectListConstructor;
 
         // check if exists, if so open existing files
@@ -680,7 +704,9 @@ public class DataFileCollection implements FileStatisticAware, Snapshotable {
         if (logger.isTraceEnabled()) {
             setOfNewFileIndexes.add(newFileIndex);
         }
-        return new DataFileWriter(storeName, storeDir, newFileIndex, creationTime, compactionLevel);
+        return parallel
+                ? new PwriteDataFileWriter(storeName, storeDir, newFileIndex, creationTime, compactionLevel)
+                : new MmapDataFileWriter(storeName, storeDir, newFileIndex, creationTime, compactionLevel);
     }
 
     /**
