@@ -9,7 +9,6 @@ import static com.swirlds.merkledb.files.DataFileCommon.createDataFilePath;
 import com.hedera.pbj.runtime.ProtoWriterTools;
 import com.hedera.pbj.runtime.io.buffer.BufferedData;
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
@@ -71,7 +70,7 @@ public final class DataFileWriter {
     private DataFileMetadata metadata;
 
     /** Total number of items written to this file */
-    private long itemsCount = 0;
+    private final AtomicLong itemsCount = new AtomicLong(0);
 
     private final long dataBufferSize;
     private final long halfBufferSize;
@@ -124,7 +123,8 @@ public final class DataFileWriter {
                 filePrefix, dataFileDir, index, creationTime, compactionLevel, DataFileCommon.FILE_EXTENSION);
         Files.createFile(path);
         fileChannel = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
-        metadata = new DataFileMetadata(index, creationTime, compactionLevel, itemsCount);
+        // Items count will be updated after the file is completely written
+        metadata = new DataFileMetadata(index, creationTime, compactionLevel, 0);
 
         headerSize = writeHeader();
         currentWriteOffset.set(headerSize);
@@ -242,13 +242,15 @@ public final class DataFileWriter {
                         + (sizeToWrite - writeBuf.remaining()));
             }
         } finally {
-            writingWindow.release();
-            if ((fileOffset / halfBufferSize) != ((fileOffset + sizeToWrite) / halfBufferSize)) {
+            synchronized (this) {
                 writingWindow.release();
+                if ((fileOffset / halfBufferSize) != ((fileOffset + sizeToWrite) / halfBufferSize)) {
+                    writingWindow.release();
+                }
             }
         }
 
-        itemsCount++;
+        itemsCount.incrementAndGet();
         // return the offset where we wrote the data
         return DataFileCommon.dataLocation(metadata.getIndex(), fileOffset);
     }
@@ -295,13 +297,15 @@ public final class DataFileWriter {
                         + (sizeToWrite - writeBuffer.remaining()));
             }
         } finally {
-            writingWindow.release();
-            if ((fileOffset / halfBufferSize) != ((fileOffset + sizeToWrite) / halfBufferSize)) {
+            synchronized (this) {
                 writingWindow.release();
+                if ((fileOffset / halfBufferSize) != ((fileOffset + sizeToWrite) / halfBufferSize)) {
+                    writingWindow.release();
+                }
             }
         }
 
-        itemsCount++;
+        itemsCount.incrementAndGet();
         // return the offset where we wrote the data
         return DataFileCommon.dataLocation(metadata.getIndex(), fileOffset);
     }
@@ -336,7 +340,7 @@ public final class DataFileWriter {
         // is FIXED64 (always 8 bytes regardless of value), so this cannot
         // overwrite data items.
         metadata = new DataFileMetadata(
-                metadata.getIndex(), metadata.getCreationDate(), metadata.getCompactionLevel(), itemsCount);
+                metadata.getIndex(), metadata.getCreationDate(), metadata.getCompactionLevel(), itemsCount.get());
         writeHeader();
 
         // Truncate after header rewrite. writeHeader() maps a 1024-byte buffer
