@@ -15,6 +15,8 @@ import com.swirlds.base.utility.ToStringBuilder;
 import com.swirlds.virtualmap.internal.cache.VirtualNodeCache;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import edu.umd.cs.findbugs.annotations.Nullable;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.Objects;
 
 /**
@@ -270,12 +272,19 @@ public class VirtualLeafBytes<V> {
         ProtoWriterTools.writeTag(out, FIELD_LEAFRECORD_KEY);
         out.writeVarInt(Math.toIntExact(kb.length()), false);
         kb.writeTo(out);
-        final Bytes vb = valueBytes();
-        if (vb != null) {
+        if (valueBytes != null) {
             // ProtoWriterTools.writeDelimited() is not used to avoid using vb::writeTo method handle
             ProtoWriterTools.writeTag(out, FIELD_LEAFRECORD_VALUE);
-            out.writeVarInt(Math.toIntExact(vb.length()), false);
-            vb.writeTo(out);
+            out.writeVarInt(Math.toIntExact(valueBytes.length()), false);
+            valueBytes.writeTo(out);
+        } else if (value != null) {
+            try {
+                ProtoWriterTools.writeTag(out, FIELD_LEAFRECORD_VALUE);
+                out.writeVarInt(valueCodec.measureRecord(value), false);
+                valueCodec.write(value, out);
+            } catch (final IOException z) {
+                throw new UncheckedIOException(z);
+            }
         }
         assert out.position() == pos + getSizeInBytes()
                 : "pos=" + pos + ", out.position()=" + out.position() + ", size=" + getSizeInBytes();
@@ -295,15 +304,22 @@ public class VirtualLeafBytes<V> {
         out.writeByte((byte) 0x00);
 
         final Bytes kb = keyBytes();
-        final Bytes vb = valueBytes();
 
         ProtoWriterTools.writeTag(out, FIELD_LEAFRECORD_KEY);
         out.writeVarInt(Math.toIntExact(kb.length()), false);
         kb.writeTo(out);
-        if (vb != null) {
+        if (valueBytes != null) {
             ProtoWriterTools.writeTag(out, FIELD_LEAFRECORD_VALUE);
-            out.writeVarInt(Math.toIntExact(vb.length()), false);
-            vb.writeTo(out);
+            out.writeVarInt(Math.toIntExact(valueBytes.length()), false);
+            valueBytes.writeTo(out);
+        } else if (value != null) {
+            try {
+                ProtoWriterTools.writeTag(out, FIELD_LEAFRECORD_VALUE);
+                out.writeVarInt(valueCodec.measureRecord(value), false);
+                valueCodec.write(value, out);
+            } catch (final IOException z) {
+                throw new UncheckedIOException(z);
+            }
         }
     }
 
