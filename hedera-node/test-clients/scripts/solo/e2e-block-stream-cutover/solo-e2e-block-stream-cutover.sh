@@ -1,0 +1,2288 @@
+#!/usr/bin/env bash
+# Block Stream Cutover
+#- [ ] Deploy v0.73.0 with application.properties
+#- [ ] Upgrade to v0.74.0-rc.1 with application.properties
+#- [ ] Produce jumpstart.bin via block-node wrapping tool (offline)
+#- [ ] Build temp upgrade properties using parsed jumpstart values
+#- [ ] Upgrade to local build as v0.75.0 with application.properties and jumpstart values
+#- [ ] Upgrade to v0.76.0 -> (*Maybe streaming WRBs to BNs here)
+#- [ ] Upgrade to v0.77.0 -> Block Stream Cutover w/TSS
+#    - [ ] *** Use WRAPS proving key, verification produced by ceremony
+#         - TSS Library Requires env var to be set
+#             environment.put("TSS_LIB_WRAPS_ARTIFACTS_PATH", System.getProperty("hapi.spec.tssLibWrapsArtifactsPath", ""));
+#    - [ ] Enabling Feature flags
+             #tss.wrapsProvingKeyPath=
+             #tss.wrapsProvingKeyHash=
+             #tss.wrapsProvingKeyDownloadUrl=?
+             #tss.hintsEnabled = true
+             #tss.historyEnabled = true
+             #tss.wrapsEnabled = true
+             #hedera.recordStream.computeHashesFromWrappedRecordBlocks = true
+             #hedera.recordStream.liveWritePrevWrappedRecordHashes = true
+             #blockStream.cutoverEnabled = false (*only used for when we cutover to BLOCKS only)
+             #blockStream.enableStateProofs = true
+             #tss.forceMockSignatures = true
+#- [ ] Perform more software upgrades of CN to simulate v0.75.0, v0.76.0, etc. and ensure blocks keep flowing e2e
+#- [ ] Perform rolling upgrades of block nodes and ensure block keep flowing e2e
+
+set -eo pipefail
+set +m
+
+NODE_COUNT_PARAM=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--nodes)
+      if [[ $# -lt 2 ]]; then
+        echo "Missing value for $1 (expected 3 or 4)" >&2
+        exit 1
+      fi
+      NODE_COUNT_PARAM="$2"
+      shift 2
+      ;;
+    --nodes=*)
+      NODE_COUNT_PARAM="${1#*=}"
+      shift
+      ;;
+    -h|--help)
+      cat <<'EOF'
+Usage: solo-e2e-block-stream-cutover.sh [--nodes 3|4]
+
+Options:
+  -n, --nodes 3|4   Number of consensus nodes to deploy.
+                    3 => node1,node2,node3
+                    4 => node1,node2,node3,node4
+                    If omitted, NODE_ALIASES env var (or default node1,node2,node3,node4) is used.
+Environment:
+  BLOCK_NODE_REPO_PATH      Path to hiero-block-node checkout (default: ../hiero-block-node)
+  USE_BLOCK_NODE_JUMPSTART  true|false (default: true)
+  BLOCKS_WRAP_EXTRA_ARGS    Extra args appended to `blocks wrap ...`
+  JUMPSTART_BIN_PATH        Optional explicit jumpstart.bin path (if tool writes elsewhere)
+  APP_PROPS_073_FILE         application.properties for the initial 0.73.0 deployment
+                            (default: resources/0.73/application.properties next to this script)
+  APP_PROPS_074_FILE         application.properties for the 0.74.0-rc.1 tagged upgrade
+                            (default: resources/0.74/application.properties next to this script)
+  APP_PROPS_075_FILE         application.properties for the local-build 0.75.0 jumpstart upgrade
+                            (default: resources/0.75/application.properties next to this script)
+  APP_PROPS_076_FILE         application.properties for the local-build 0.76.0 upgrade
+                            (default: resources/0.76/application.properties next to this script)
+  UPGRADE_074_RELEASE_TAG    Solo release tag for the intermediate upgrade (default: v0.74.0-rc.1)
+  UPGRADE_075_VERSION        Solo upgrade-version for the local-build jumpstart step
+                            Placeholder value required by Solo; local build is used regardless
+                            (default: v0.73.0)
+  UPGRADE_076_VERSION        Solo upgrade-version for the local-build 0.76 step
+                            Placeholder value required by Solo; local build is used regardless
+                            (default: v0.73.0)
+  SOLO_075_UPGRADE_TIMEOUT_SECS  Timeout for the 0.75 local-build upgrade (default: 900)
+  SOLO_076_UPGRADE_TIMEOUT_SECS  Timeout for the 0.76 local-build upgrade (default: 900)
+  KEEP_PORT_FORWARD_WATCHDOG true|false; keep CN/mirror/grafana forwards healthy post-run (default: true)
+  EXPLORER_INGRESS_LOCAL_PORT Local port for explorer UI tunnel (default: 38081)
+  EXPLORER_INGRESS_SERVICE_NAME Explorer service name (default: hiero-explorer-1-solo)
+  EXPLORER_ADD_RETRIES           Retry count for explorer chart deployment in baseline setup (default: 3)
+  EXPLORER_ADD_RETRY_DELAY_SECS  Delay between explorer deployment retries (default: 20)
+  ALLOW_EXPLORER_DEPLOY_FAILURE  true|false, continue baseline when explorer deploy fails after retries (default: true)
+EOF
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      echo "Use --help for usage." >&2
+      exit 1
+      ;;
+  esac
+done
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../../.." && pwd)"
+
+export SOLO_CLUSTER_NAME="solo"
+export SOLO_NAMESPACE="solo"
+export SOLO_CLUSTER_SETUP_NAMESPACE="solo-cluster"
+export SOLO_DEPLOYMENT="solo-deployment"
+if [[ -n "${NODE_COUNT_PARAM}" ]]; then
+  case "${NODE_COUNT_PARAM}" in
+    3) NODE_ALIASES="node1,node2,node3" ;;
+    4) NODE_ALIASES="node1,node2,node3,node4" ;;
+    *)
+      echo "Invalid --nodes value: ${NODE_COUNT_PARAM} (expected 3 or 4)" >&2
+      exit 1
+      ;;
+  esac
+else
+  NODE_ALIASES="${NODE_ALIASES:-node1,node2,node3,node4}"
+fi
+CONSENSUS_NODE_COUNT="$(awk -F',' '{print NF}' <<< "${NODE_ALIASES}")"
+LOCAL_BUILD_PATH="${LOCAL_BUILD_PATH:-${REPO_ROOT}/hedera-node/data}"
+LOG4J2_XML_PATH="${REPO_ROOT}/hedera-node/configuration/dev/log4j2.xml"
+APP_PROPS_073_FILE="${APP_PROPS_073_FILE:-${SCRIPT_DIR}/resources/0.73/application.properties}"
+APP_PROPS_074_FILE="${APP_PROPS_074_FILE:-${SCRIPT_DIR}/resources/0.74/application.properties}"
+APP_PROPS_075_FILE="${APP_PROPS_075_FILE:-${SCRIPT_DIR}/resources/0.75/application.properties}"
+APP_PROPS_076_FILE="${APP_PROPS_076_FILE:-${SCRIPT_DIR}/resources/0.76/application.properties}"
+APP_ENV_076_FILE="${APP_ENV_076_FILE:-${SCRIPT_DIR}/resources/0.76/application.env}"
+INITIAL_RELEASE_TAG="${INITIAL_RELEASE_TAG:-v0.73.0}"
+UPGRADE_074_RELEASE_TAG="${UPGRADE_074_RELEASE_TAG:-v0.74.0-rc.1}"
+UPGRADE_075_VERSION="${UPGRADE_075_VERSION:-v0.73.0}"
+UPGRADE_076_VERSION="${UPGRADE_076_VERSION:-v0.73.0}"
+SOLO_HOME_DIR="${HOME}/.solo"
+HAPI_PATH="/opt/hgcapp/services-hedera/HapiApp2.0"
+WRAPS_ARTIFACTS_CONTAINER_DIR_DEFAULT="${HAPI_PATH}/keys/wraps"
+# After "Update node configuration files", Solo Helm-rolls pods then kubectl-cp's LOCAL_BUILD_PATH in parallel (Solo default 4).
+# On kind, concurrent large copies can hit pods still in Failed/Terminating — serialize copies unless overridden.
+SOLO_075_UPGRADE_TIMEOUT_SECS="${SOLO_075_UPGRADE_TIMEOUT_SECS:-900}"
+SOLO_076_UPGRADE_TIMEOUT_SECS="${SOLO_076_UPGRADE_TIMEOUT_SECS:-900}"
+WRAPS_PROOF_TIMEOUT_SECS="${WRAPS_PROOF_TIMEOUT_SECS:-120}"
+EXPLORER_ADD_RETRIES="${EXPLORER_ADD_RETRIES:-3}"
+EXPLORER_ADD_RETRY_DELAY_SECS="${EXPLORER_ADD_RETRY_DELAY_SECS:-20}"
+ALLOW_EXPLORER_DEPLOY_FAILURE="${ALLOW_EXPLORER_DEPLOY_FAILURE:-true}"
+MIRROR_RESTJAVA_MEMORY_REQUEST="${MIRROR_RESTJAVA_MEMORY_REQUEST:-512Mi}"
+MIRROR_RESTJAVA_MEMORY_LIMIT="${MIRROR_RESTJAVA_MEMORY_LIMIT:-1000Mi}"
+
+# SHA-384 hashes are 48 bytes => 96 hex chars.
+SHA384_ZERO_HEX="$(printf '0%.0s' {1..96})"
+SHA384_ONE_HEX="$(printf '1%.0s' {1..96})"
+
+# Placeholder jumpstart properties used when jumpstart.bin parsing is skipped.
+JUMPSTART_PREV_WRAPPED_RECORD_BLOCK_HASH="${JUMPSTART_PREV_WRAPPED_RECORD_BLOCK_HASH:-${SHA384_ZERO_HEX}}"
+JUMPSTART_CONSENSUS_TIMESTAMP_HASH="${JUMPSTART_CONSENSUS_TIMESTAMP_HASH:-${SHA384_ZERO_HEX}}"
+JUMPSTART_OUTPUT_ITEMS_TREE_ROOT_HASH="${JUMPSTART_OUTPUT_ITEMS_TREE_ROOT_HASH:-${SHA384_ZERO_HEX}}"
+JUMPSTART_STREAMING_HASHER_LEAF_COUNT="${JUMPSTART_STREAMING_HASHER_LEAF_COUNT:-1}"
+JUMPSTART_STREAMING_HASHER_HASH_COUNT="${JUMPSTART_STREAMING_HASHER_HASH_COUNT:-1}"
+# Comma-separated dummy subtree hashes (placeholder until real jumpstart tooling).
+JUMPSTART_STREAMING_HASHER_SUBTREE_HASHES="${JUMPSTART_STREAMING_HASHER_SUBTREE_HASHES:-${SHA384_ONE_HEX}}"
+export JUMPSTART_PREV_WRAPPED_RECORD_BLOCK_HASH
+export JUMPSTART_CONSENSUS_TIMESTAMP_HASH
+export JUMPSTART_OUTPUT_ITEMS_TREE_ROOT_HASH
+export JUMPSTART_STREAMING_HASHER_LEAF_COUNT
+export JUMPSTART_STREAMING_HASHER_HASH_COUNT
+export JUMPSTART_STREAMING_HASHER_SUBTREE_HASHES
+
+CN_GRPC_LOCAL_PORT="${CN_GRPC_LOCAL_PORT:-50211}"
+MIRROR_REST_LOCAL_PORT="${MIRROR_REST_LOCAL_PORT:-5551}"
+MIRROR_REST_SERVICE="${MIRROR_REST_SERVICE:-mirror-1-rest}"
+GRAFANA_LOCAL_PORT="${GRAFANA_LOCAL_PORT:-3000}"
+GRAFANA_SERVICE_NAME="${GRAFANA_SERVICE_NAME:-kube-prometheus-stack-grafana}"
+EXPLORER_INGRESS_LOCAL_PORT="${EXPLORER_INGRESS_LOCAL_PORT:-38081}"
+EXPLORER_INGRESS_SERVICE_NAME="${EXPLORER_INGRESS_SERVICE_NAME:-hiero-explorer-1-solo}"
+KEEP_NETWORK="${KEEP_NETWORK:-true}"
+# If true, script continues when Grafana forwarding cannot be established.
+ALLOW_GRAFANA_PORT_FORWARD_FAILURE="${ALLOW_GRAFANA_PORT_FORWARD_FAILURE:-true}"
+KEEP_PORT_FORWARD_WATCHDOG="${KEEP_PORT_FORWARD_WATCHDOG:-true}"
+
+# Downloaded record stream objects from Solo MinIO (Step 5), next to this script.
+RECORD_STREAMS_DIR="${RECORD_STREAMS_DIR:-${SCRIPT_DIR}/recordStreams}"
+WRAPPED_BLOCKS_DIR="${WRAPPED_BLOCKS_DIR:-${SCRIPT_DIR}/wrappedBlocks}"
+MINIO_BUCKET="${MINIO_BUCKET:-solo-streams}"
+MINIO_NAMESPACE="${MINIO_NAMESPACE:-${SOLO_NAMESPACE}}"
+# Optional overrides if auto-discovery fails (service name in MINIO_NAMESPACE).
+MINIO_SERVICE_NAME="${MINIO_SERVICE_NAME:-}"
+
+# Block Node offline wrapping tool configuration (Step 5 jumpstart generation).
+USE_BLOCK_NODE_JUMPSTART="${USE_BLOCK_NODE_JUMPSTART:-true}"
+BLOCK_NODE_REPO_PATH="${BLOCK_NODE_REPO_PATH:-${REPO_ROOT}/../hiero-block-node}"
+BLOCKS_WRAP_EXTRA_ARGS="${BLOCKS_WRAP_EXTRA_ARGS:-}"
+JUMPSTART_BIN_PATH="${JUMPSTART_BIN_PATH:-}"
+
+OPERATOR_ACCOUNT_ID="${OPERATOR_ACCOUNT_ID:-0.0.2}"
+OPERATOR_PRIVATE_KEY="${OPERATOR_PRIVATE_KEY:-302e020100300506032b65700422042091132178e72057a1d7528025956fe39b0b847f200ab59b2fdd367017f3087137}"
+
+WORK_DIR="$(mktemp -d)"
+NODE_SCRIPT="${WORK_DIR}/sdk-crypto-create-check.js"
+NETWORK_PROBE_SCRIPT="${WORK_DIR}/sdk-network-probe.js"
+JUMPSTART_PARSE_SCRIPT="${WORK_DIR}/parse-jumpstart-bin.js"
+TMP_075_UPGRADE_APP_PROPS="${WORK_DIR}/application-075-jumpstart.properties"
+MIRROR_NODE_VALUES_FILE="${WORK_DIR}/mirror-node-cutover-values.yaml"
+BLOCK_TIMES_FILE="${WORK_DIR}/block_times.bin"
+DAY_BLOCKS_FILE="${WORK_DIR}/day_blocks.json"
+MIRROR_METADATA_SCRIPT="${WORK_DIR}/generate-mirror-metadata.js"
+WRAP_DAYS_SRC_DIR="${WORK_DIR}/recordDays"
+WRAP_COMPRESSED_DAYS_DIR="${WORK_DIR}/compressedDays"
+ZSTD_WRAPPER_DIR="${WORK_DIR}/zstd-wrapper"
+ZSTD_WRAPPER_SRC="${ZSTD_WRAPPER_DIR}/ZstdCat.java"
+ZSTD_WRAPPER_BIN="${ZSTD_WRAPPER_DIR}/zstd"
+PORT_FORWARD_WATCHDOG_SCRIPT="${WORK_DIR}/post-run-port-forward-watchdog.sh"
+PORT_FORWARD_WATCHDOG_LOG="${WORK_DIR}/post-run-port-forward-watchdog.log"
+
+CN_PORT_FORWARD_PID=""
+MIRROR_PORT_FORWARD_PID=""
+GRAFANA_PORT_FORWARD_PID=""
+EXPLORER_INGRESS_PORT_FORWARD_PID=""
+PORT_FORWARD_WATCHDOG_PID=""
+ACTIVE_GRAFANA_SERVICE_NAME="${GRAFANA_SERVICE_NAME}"
+ACTIVE_INGRESS_NAMESPACE="${SOLO_NAMESPACE}"
+ACTIVE_INGRESS_SERVICE_NAME="${EXPLORER_INGRESS_SERVICE_NAME}"
+ACTIVE_INGRESS_REMOTE_PORT="80"
+
+log() { :; }
+
+print_banner() {
+  local msg="$1"
+  echo
+  echo "======================================================================"
+  echo "== ${msg}"
+  echo "======================================================================"
+}
+
+cleanup() {
+  local exit_code=$?
+
+  if [[ ${exit_code} -ne 0 ]]; then
+    return
+  fi
+
+  if [[ "${KEEP_NETWORK}" == "true" ]]; then
+    return
+  fi
+
+  set +e
+  [[ -n "${CN_PORT_FORWARD_PID}" ]] && kill "${CN_PORT_FORWARD_PID}" >/dev/null 2>&1 || true
+  [[ -n "${MIRROR_PORT_FORWARD_PID}" ]] && kill "${MIRROR_PORT_FORWARD_PID}" >/dev/null 2>&1 || true
+  [[ -n "${GRAFANA_PORT_FORWARD_PID}" ]] && kill "${GRAFANA_PORT_FORWARD_PID}" >/dev/null 2>&1 || true
+  [[ -n "${EXPLORER_INGRESS_PORT_FORWARD_PID}" ]] && kill "${EXPLORER_INGRESS_PORT_FORWARD_PID}" >/dev/null 2>&1 || true
+  [[ -n "${PORT_FORWARD_WATCHDOG_PID}" ]] && kill "${PORT_FORWARD_WATCHDOG_PID}" >/dev/null 2>&1 || true
+
+  if command -v solo >/dev/null 2>&1; then
+    solo explorer node destroy --deployment "${SOLO_DEPLOYMENT}" >/dev/null 2>&1 || true
+    solo relay node destroy --deployment "${SOLO_DEPLOYMENT}" --node-aliases "${NODE_ALIASES}" >/dev/null 2>&1 || true
+    solo mirror node destroy --deployment "${SOLO_DEPLOYMENT}" --force >/dev/null 2>&1 || true
+    solo block node destroy --deployment "${SOLO_DEPLOYMENT}" >/dev/null 2>&1 || true
+    solo consensus node stop --deployment "${SOLO_DEPLOYMENT}" --node-aliases "${NODE_ALIASES}" >/dev/null 2>&1 || true
+    solo consensus network destroy --deployment "${SOLO_DEPLOYMENT}" --force >/dev/null 2>&1 || true
+  fi
+  kind delete cluster -n "${SOLO_CLUSTER_NAME}" >/dev/null 2>&1 || true
+
+  rm -rf "${WORK_DIR}" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+require_cmd() {
+  local cmd="$1"
+  command -v "${cmd}" >/dev/null 2>&1 || { echo "Required command not found: ${cmd}" >&2; exit 1; }
+}
+
+ensure_zstd_command_for_block_node() {
+  local zstd_jar
+  if command -v zstd >/dev/null 2>&1; then
+    log "Using system zstd: $(command -v zstd)"
+    return 0
+  fi
+
+  require_cmd java
+
+  zstd_jar="$(find "${HOME}/.gradle/caches/modules-2/files-2.1/com.github.luben/zstd-jni" -name 'zstd-jni-*.jar' 2>/dev/null | head -n 1)"
+  if [[ -z "${zstd_jar}" || ! -f "${zstd_jar}" ]]; then
+    echo "zstd command not found and zstd-jni jar was not found in ~/.gradle cache." >&2
+    echo "Install zstd (for example: brew install zstd) or run one block-node tools task once to download zstd-jni, then retry." >&2
+    return 1
+  fi
+
+  mkdir -p "${ZSTD_WRAPPER_DIR}"
+  cat > "${ZSTD_WRAPPER_SRC}" <<'EOF'
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.FileInputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
+import com.github.luben.zstd.ZstdInputStream;
+
+public class ZstdCat {
+  public static void main(String[] args) throws Exception {
+    if (args.length < 1) {
+      System.err.println("Usage: ZstdCat <input.zstd>");
+      System.exit(2);
+    }
+    try (InputStream in = new BufferedInputStream(new FileInputStream(args[0]));
+         ZstdInputStream zin = new ZstdInputStream(in);
+         OutputStream out = new BufferedOutputStream(System.out)) {
+      zin.transferTo(out);
+      out.flush();
+    }
+  }
+}
+EOF
+
+  cat > "${ZSTD_WRAPPER_BIN}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+input=""
+for arg in "$@"; do
+  case "$arg" in
+    --decompress|-d|--stdout|-c) ;;
+    -T*|--threads=*) ;;
+    --) ;;
+    -*) ;;
+    *) input="$arg" ;;
+  esac
+done
+if [[ -z "${input}" ]]; then
+  echo "zstd wrapper error: missing input file argument" >&2
+  exit 2
+fi
+if [[ -z "${ZSTD_JNI_JAR:-}" || -z "${ZSTD_WRAPPER_SRC:-}" ]]; then
+  echo "zstd wrapper error: ZSTD_JNI_JAR or ZSTD_WRAPPER_SRC is not set" >&2
+  exit 2
+fi
+exec java --class-path "${ZSTD_JNI_JAR}" "${ZSTD_WRAPPER_SRC}" "${input}"
+EOF
+  chmod +x "${ZSTD_WRAPPER_BIN}"
+
+  export ZSTD_JNI_JAR="${zstd_jar}"
+  export ZSTD_WRAPPER_SRC
+  export PATH="${ZSTD_WRAPPER_DIR}:${PATH}"
+}
+
+validate_block_node_repo() {
+  if [[ ! -d "${BLOCK_NODE_REPO_PATH}" ]]; then
+    echo "BLOCK_NODE_REPO_PATH not found: ${BLOCK_NODE_REPO_PATH}" >&2
+    echo "Set BLOCK_NODE_REPO_PATH to your hiero-block-node checkout (branch driley/local-wrapped-record-files)." >&2
+    return 1
+  fi
+  if [[ ! -x "${BLOCK_NODE_REPO_PATH}/gradlew" ]]; then
+    echo "Block Node gradlew not executable: ${BLOCK_NODE_REPO_PATH}/gradlew" >&2
+    return 1
+  fi
+}
+
+validate_local_build_path() {
+  local build_path="$1"
+  [[ -d "${build_path}/lib" ]] || { echo "Missing directory: ${build_path}/lib" >&2; return 1; }
+  [[ -d "${build_path}/apps" ]] || { echo "Missing directory: ${build_path}/apps" >&2; return 1; }
+  compgen -G "${build_path}/lib/*.jar" >/dev/null || { echo "No jar files found in ${build_path}/lib" >&2; return 1; }
+  compgen -G "${build_path}/apps/*.jar" >/dev/null || { echo "No jar files found in ${build_path}/apps" >&2; return 1; }
+}
+
+wait_for_http_ok() {
+  local url="$1"
+  local max_attempts="$2"
+  local sleep_secs="$3"
+  local attempt=1
+  while (( attempt <= max_attempts )); do
+    curl -sf "${url}" >/dev/null 2>&1 && return 0
+    sleep "${sleep_secs}"
+    ((attempt++))
+  done
+  echo "Timed out waiting for HTTP endpoint: ${url}" >&2
+  return 1
+}
+
+wait_for_tcp_open() {
+  local host="$1"
+  local port="$2"
+  local max_attempts="$3"
+  local sleep_secs="$4"
+  local attempt=1
+  while (( attempt <= max_attempts )); do
+    if command -v nc >/dev/null 2>&1; then
+      nc -z "${host}" "${port}" >/dev/null 2>&1 && return 0
+    else
+      (: <"/dev/tcp/${host}/${port}") >/dev/null 2>&1 && return 0
+    fi
+    sleep "${sleep_secs}"
+    ((attempt++))
+  done
+  echo "Timed out waiting for TCP endpoint: ${host}:${port}" >&2
+  return 1
+}
+
+kill_processes_on_local_port() {
+  local port="$1"
+  local pids=""
+  if command -v lsof >/dev/null 2>&1; then
+    pids="$(lsof -ti "tcp:${port}" 2>/dev/null || true)"
+    if [[ -n "${pids}" ]]; then
+      kill ${pids} >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+cleanup_stale_port_forwards() {
+  local include_grafana="${1:-false}"
+  pkill -f "port-forward svc/haproxy-node1-svc .*${CN_GRPC_LOCAL_PORT}:non-tls-grpc-client-port" >/dev/null 2>&1 || true
+  pkill -f "port-forward svc/${MIRROR_REST_SERVICE} .*${MIRROR_REST_LOCAL_PORT}:http" >/dev/null 2>&1 || true
+  pkill -f "port-forward svc/${EXPLORER_INGRESS_SERVICE_NAME} .*${EXPLORER_INGRESS_LOCAL_PORT}:80" >/dev/null 2>&1 || true
+  if [[ "${include_grafana}" == "true" ]]; then
+    pkill -f "port-forward svc/.*grafana .*${GRAFANA_LOCAL_PORT}:80" >/dev/null 2>&1 || true
+  fi
+}
+
+mirror_rest_service_exists() {
+  kubectl -n "${SOLO_NAMESPACE}" get svc "${MIRROR_REST_SERVICE}" >/dev/null 2>&1
+}
+
+deployment_ready() {
+  local deployment="$1"
+  local timeout_secs="${2:-5}"
+  kubectl -n "${SOLO_NAMESPACE}" rollout status "deployment/${deployment}" --timeout="${timeout_secs}s" >/dev/null 2>&1
+}
+
+required_mirror_services_ready() {
+  local deployment=""
+  local deployments=(mirror-1-rest mirror-1-grpc mirror-1-importer mirror-1-monitor mirror-1-web3)
+
+  for deployment in "${deployments[@]}"; do
+    deployment_ready "${deployment}" 5 || return 1
+  done
+}
+
+wait_for_required_mirror_services_ready() {
+  local timeout_secs="${1:-600}"
+  local start_ts
+  start_ts="$(date +%s)"
+
+  while true; do
+    if required_mirror_services_ready; then
+      return 0
+    fi
+    if (( $(date +%s) - start_ts >= timeout_secs )); then
+      return 1
+    fi
+    sleep 5
+  done
+}
+
+mirror_node_failed_only_on_restjava() {
+  kubectl -n "${SOLO_NAMESPACE}" get deployment mirror-1-restjava >/dev/null 2>&1 || return 1
+  required_mirror_services_ready || return 1
+  deployment_ready mirror-1-restjava 5 && return 1
+  return 0
+}
+
+cleanup_record_stream_files_only() {
+  local removed=0
+  mkdir -p "${RECORD_STREAMS_DIR}"
+  if [[ -d "${RECORD_STREAMS_DIR}" ]]; then
+    removed="$(find "${RECORD_STREAMS_DIR}" \
+      -type f \
+      -path "${RECORD_STREAMS_DIR}/record0.0.*/*" \
+      \( -name "*.rcd" -o -name "*.rcd.gz" -o -name "*.rcd_sig" -o -name "*.rcs_sig" \) \
+      -print | wc -l | tr -d ' ')"
+    find "${RECORD_STREAMS_DIR}" \
+      -type f \
+      -path "${RECORD_STREAMS_DIR}/record0.0.*/*" \
+      \( -name "*.rcd" -o -name "*.rcd.gz" -o -name "*.rcd_sig" -o -name "*.rcs_sig" \) \
+      -delete || true
+  fi
+}
+
+wait_for_consensus_pods_ready() {
+  local timeout_secs="${1:-600}"
+  local pod=""
+  local nodes=()
+  IFS=',' read -r -a nodes <<< "${NODE_ALIASES}"
+
+  for pod in "${nodes[@]}"; do
+    kubectl -n "${SOLO_NAMESPACE}" wait --for=condition=ready "pod/network-${pod}-0" --timeout="${timeout_secs}s"
+  done
+}
+
+wait_for_haproxy_ready() {
+  local timeout_secs="${1:-600}"
+  local proxy
+  local node_alias
+  local node_aliases
+  local proxies=()
+  IFS=',' read -r -a node_aliases <<< "${NODE_ALIASES}"
+  for node_alias in "${node_aliases[@]}"; do
+    proxies+=("haproxy-${node_alias}")
+  done
+
+  for proxy in "${proxies[@]}"; do
+    kubectl -n "${SOLO_NAMESPACE}" rollout status "deployment/${proxy}" --timeout="${timeout_secs}s"
+  done
+}
+
+# kubectl port-forward ties to pod endpoints; consensus network upgrade rolls HAProxy/backends and
+# leaves the old tunnel broken even though localhost still listens. Port numbers (50211 in-cluster)
+# do not change — the forward must be recreated.
+restart_post_upgrade_port_forwards() {
+  if [[ -n "${CN_PORT_FORWARD_PID}" ]]; then
+    kill "${CN_PORT_FORWARD_PID}" >/dev/null 2>&1 || true
+    CN_PORT_FORWARD_PID=""
+  fi
+  if [[ -n "${MIRROR_PORT_FORWARD_PID}" ]]; then
+    kill "${MIRROR_PORT_FORWARD_PID}" >/dev/null 2>&1 || true
+    MIRROR_PORT_FORWARD_PID=""
+  fi
+  cleanup_stale_port_forwards
+  kill_processes_on_local_port "${CN_GRPC_LOCAL_PORT}"
+  kill_processes_on_local_port "${MIRROR_REST_LOCAL_PORT}"
+  sleep 1
+  nohup kubectl -n "${SOLO_NAMESPACE}" port-forward svc/haproxy-node1-svc "${CN_GRPC_LOCAL_PORT}:non-tls-grpc-client-port" >/dev/null 2>&1 < /dev/null &
+  CN_PORT_FORWARD_PID="$!"
+  disown "${CN_PORT_FORWARD_PID}" 2>/dev/null || true
+  if mirror_rest_service_exists; then
+    nohup kubectl -n "${SOLO_NAMESPACE}" port-forward "svc/${MIRROR_REST_SERVICE}" "${MIRROR_REST_LOCAL_PORT}:http" >/dev/null 2>&1 < /dev/null &
+    MIRROR_PORT_FORWARD_PID="$!"
+    disown "${MIRROR_PORT_FORWARD_PID}" 2>/dev/null || true
+  fi
+  sleep 2
+  if ! wait_for_tcp_open "127.0.0.1" "${CN_GRPC_LOCAL_PORT}" 20 1; then
+    echo "Consensus gRPC port-forward did not become reachable on localhost:${CN_GRPC_LOCAL_PORT}" >&2
+    return 1
+  fi
+  if [[ -n "${MIRROR_PORT_FORWARD_PID}" ]] && ! wait_for_tcp_open "127.0.0.1" "${MIRROR_REST_LOCAL_PORT}" 20 1; then
+    echo "Mirror REST port-forward did not become reachable on localhost:${MIRROR_REST_LOCAL_PORT}" >&2
+    return 1
+  fi
+}
+
+minio_discover_service() {
+  local ns="$1"
+  local svc
+  if [[ -n "${MINIO_SERVICE_NAME}" ]]; then
+    echo "${MINIO_SERVICE_NAME}"
+    return 0
+  fi
+  if kubectl -n "${ns}" get svc minio >/dev/null 2>&1; then
+    echo "minio"
+    return 0
+  fi
+  if kubectl -n "${ns}" get svc minio-hl >/dev/null 2>&1; then
+    echo "minio-hl"
+    return 0
+  fi
+  svc="$(kubectl -n "${ns}" get svc -o json 2>/dev/null | jq -r '
+    .items[].metadata.name
+    | select(test("minio"; "i"))
+    | select(test("console"; "i") | not)
+    | select(test("headless"; "i") | not)
+  ' | head -n 1)"
+  if [[ -z "${svc}" ]]; then
+    return 1
+  fi
+  echo "${svc}"
+}
+
+minio_discover_service_port() {
+  local ns="$1"
+  local svc="$2"
+  local port
+  # Prefer the service port that targets container port 9000.
+  port="$(kubectl -n "${ns}" get svc "${svc}" -o json 2>/dev/null | jq -r '
+    first(.spec.ports[] | select((.targetPort|tostring) == "9000") | .port // empty)
+  ')"
+  if [[ -z "${port}" || "${port}" == "null" ]]; then
+    port="$(kubectl -n "${ns}" get svc "${svc}" -o json 2>/dev/null | jq -r '.spec.ports[0].port // empty')"
+  fi
+  [[ -n "${port}" && "${port}" != "null" ]] || return 1
+  echo "${port}"
+}
+
+minio_discover_pod_credentials() {
+  local ns="$1"
+  local pod u p cfg
+  pod="$(kubectl -n "${ns}" get pods -o json 2>/dev/null | jq -r '
+    .items[].metadata.name
+    | select(test("^minio-"))
+  ' | head -n 1)"
+  [[ -n "${pod}" ]] || return 1
+
+  cfg="$(kubectl -n "${ns}" exec "${pod}" -c minio -- sh -lc 'cat "${MINIO_CONFIG_ENV_FILE:-/tmp/minio/config.env}" 2>/dev/null || true' 2>/dev/null || true)"
+  if [[ -n "${cfg}" ]]; then
+    u="$(echo "${cfg}" | sed -n -E 's/^(export[[:space:]]+)?MINIO_ROOT_USER=//p' | head -1 | tr -d '\r')"
+    p="$(echo "${cfg}" | sed -n -E 's/^(export[[:space:]]+)?MINIO_ROOT_PASSWORD=//p' | head -1 | tr -d '\r')"
+    if [[ -z "${u}" || -z "${p}" ]]; then
+      u="$(echo "${cfg}" | sed -n -E 's/^(export[[:space:]]+)?MINIO_ACCESS_KEY=//p' | head -1 | tr -d '\r')"
+      p="$(echo "${cfg}" | sed -n -E 's/^(export[[:space:]]+)?MINIO_SECRET_KEY=//p' | head -1 | tr -d '\r')"
+    fi
+  fi
+  u="${u//$'\r'/}"
+  p="${p//$'\r'/}"
+  u="${u%\"}"
+  u="${u#\"}"
+  p="${p%\"}"
+  p="${p#\"}"
+  if [[ -n "${u}" && -n "${p}" ]]; then
+    printf '%s\n' "${u}" "${p}"
+    return 0
+  fi
+  return 1
+}
+
+minio_discover_secret_env_credentials() {
+  local ns="$1"
+  local secret="$2"
+  local cfg u p
+  cfg="$(kubectl -n "${ns}" get secret "${secret}" -o jsonpath='{.data.config\.env}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+  [[ -n "${cfg}" ]] || return 1
+  u="$(echo "${cfg}" | sed -n -E 's/^(export[[:space:]]+)?MINIO_ROOT_USER=//p' | head -1 | tr -d '\r')"
+  p="$(echo "${cfg}" | sed -n -E 's/^(export[[:space:]]+)?MINIO_ROOT_PASSWORD=//p' | head -1 | tr -d '\r')"
+  u="${u%\"}"
+  u="${u#\"}"
+  p="${p%\"}"
+  p="${p#\"}"
+  if [[ -n "${u}" && -n "${p}" ]]; then
+    printf '%s\n' "${u}" "${p}"
+    return 0
+  fi
+  return 1
+}
+
+download_solo_record_streams_via_pod_mc() {
+  local names_file="$1"
+  local svc="$2"
+  local svc_port="$3"
+  local pod endpoint creds_tmp all_objects creds_file
+  local wanted_timestamps selected_objects
+  local u p selected_u selected_p remote subpath dest
+  local server_url cfg_full
+  local list_ok=0 endpoint_try
+  local wanted_count selected_count matched_timestamps
+  local found=0 sig_found=0 failed=0
+
+  pod="$(kubectl -n "${MINIO_NAMESPACE}" get pods -o json 2>/dev/null | jq -r '
+    .items[].metadata.name
+    | select(test("^minio-"))
+  ' | head -n 1)"
+  [[ -n "${pod}" ]] || {
+    echo "Could not find MinIO pod in namespace ${MINIO_NAMESPACE}" >&2
+    return 1
+  }
+
+  creds_file="$(mktemp)"
+  creds_tmp="$(mktemp)"
+  if minio_discover_pod_credentials "${MINIO_NAMESPACE}" >"${creds_tmp}"; then
+    paste -sd '\t' "${creds_tmp}" >>"${creds_file}"
+  fi
+  : >"${creds_tmp}"
+  if minio_discover_secret_env_credentials "${MINIO_NAMESPACE}" "minio-secrets" >"${creds_tmp}"; then
+    paste -sd '\t' "${creds_tmp}" >>"${creds_file}"
+  fi
+  : >"${creds_tmp}"
+  if minio_discover_secret_env_credentials "${MINIO_NAMESPACE}" "myminio-env-configuration" >"${creds_tmp}"; then
+    paste -sd '\t' "${creds_tmp}" >>"${creds_file}"
+  fi
+  rm -f "${creds_tmp}"
+  if [[ ! -s "${creds_file}" ]]; then
+    rm -f "${creds_file}"
+    echo "Could not discover any MinIO root credentials in namespace ${MINIO_NAMESPACE}" >&2
+    return 1
+  fi
+
+  cfg_full="$(kubectl -n "${MINIO_NAMESPACE}" exec "${pod}" -c minio -- sh -lc \
+    "cat \"\${MINIO_CONFIG_ENV_FILE:-/tmp/minio/config.env}\" 2>/dev/null || true" 2>/dev/null || true)"
+  server_url="$(echo "${cfg_full}" | sed -n -E 's/^(export[[:space:]]+)?MINIO_SERVER_URL=//p' | head -1 | tr -d '"\r')"
+
+  all_objects="$(mktemp)"
+  # Retries plus alternate in-cluster endpoints avoid transient DNS/service hiccups during upgrade.
+  for _ in 1 2 3 4 5 6; do
+    for endpoint_try in \
+      "${server_url}" \
+      "http://${svc}.${MINIO_NAMESPACE}.svc.cluster.local:${svc_port}" \
+      "http://minio-hl.${MINIO_NAMESPACE}.svc.cluster.local:9000"; do
+      [[ -n "${endpoint_try}" ]] || continue
+      endpoint="${endpoint_try}"
+      while IFS=$'\t' read -r u p; do
+        [[ -n "${u}" && -n "${p}" ]] || continue
+        if kubectl -n "${MINIO_NAMESPACE}" exec "${pod}" -c minio -- sh -lc \
+          "mc alias set local '${endpoint}' '${u}' '${p}' >/dev/null 2>&1; mc find local/${MINIO_BUCKET}/recordstreams --name '*.rcd*'" \
+          >"${all_objects}" 2>/tmp/inpod-mc-list.err; then
+          selected_u="${u}"
+          selected_p="${p}"
+          list_ok=1
+          break
+        fi
+      done < "${creds_file}"
+      (( list_ok == 1 )) && break
+    done
+    (( list_ok == 1 )) && break
+    sleep 2
+  done
+  rm -f "${creds_file}" >/dev/null 2>&1 || true
+  if (( list_ok == 0 )); then
+    rm -f "${all_objects}"
+    echo "Failed to list MinIO objects via in-pod mc" >&2
+    return 1
+  fi
+
+  wanted_timestamps="$(mktemp)"
+  selected_objects="$(mktemp)"
+  awk '{
+    f = $0;
+    sub(/^.*\//, "", f);
+    if (match(f, /Z/)) {
+      print substr(f, 1, RSTART);
+    }
+  }' "${names_file}" | sort -u > "${wanted_timestamps}"
+  wanted_count="$(wc -l < "${wanted_timestamps}" | tr -d ' ')"
+  if [[ "${wanted_count}" == "0" ]]; then
+    rm -f "${wanted_timestamps}" "${selected_objects}" "${all_objects}" >/dev/null 2>&1 || true
+    echo "Could not derive wanted timestamps from mirror names file" >&2
+    return 1
+  fi
+
+  awk 'NR == FNR { wanted[$1] = 1; next }
+    {
+      bn = $0;
+      sub(/^.*\//, "", bn);
+      if (match(bn, /Z/)) {
+        ts = substr(bn, 1, RSTART);
+        if (wanted[ts]) {
+          print $0;
+        }
+      }
+    }' "${wanted_timestamps}" "${all_objects}" | sort -u > "${selected_objects}"
+
+  selected_count="$(wc -l < "${selected_objects}" | tr -d ' ')"
+  matched_timestamps="$(awk '{
+    bn = $0;
+    sub(/^.*\//, "", bn);
+    if (match(bn, /Z/)) {
+      print substr(bn, 1, RSTART);
+    }
+  }' "${selected_objects}" | sort -u | wc -l | tr -d ' ')"
+
+  while IFS= read -r remote; do
+    [[ -z "${remote}" ]] && continue
+
+    subpath="${remote#local/${MINIO_BUCKET}/recordstreams/}"
+    if [[ "${subpath}" == "${remote}" ]]; then
+      subpath="$(basename "${remote}")"
+    fi
+    dest="${RECORD_STREAMS_DIR}/${subpath}"
+    mkdir -p "$(dirname "${dest}")"
+
+    local copied=0
+    for _ in 1 2 3; do
+      if kubectl -n "${MINIO_NAMESPACE}" exec "${pod}" -c minio -- sh -lc \
+        "mc alias set local '${endpoint}' '${selected_u}' '${selected_p}' >/dev/null 2>&1; mc cat '${remote}'" \
+        >"${dest}" 2>/dev/null; then
+        copied=1
+        break
+      fi
+      sleep 1
+    done
+    if (( copied == 1 )); then
+      found=$((found + 1))
+      if [[ "${remote}" == *.rcd_sig || "${remote}" == *.rcs_sig ]]; then
+        sig_found=$((sig_found + 1))
+      fi
+    else
+      rm -f "${dest}" >/dev/null 2>&1 || true
+      failed=$((failed + 1))
+    fi
+  done < "${selected_objects}"
+
+  rm -f "${wanted_timestamps}" >/dev/null 2>&1 || true
+  rm -f "${selected_objects}" >/dev/null 2>&1 || true
+  rm -f "${all_objects}" >/dev/null 2>&1 || true
+
+  if (( found == 0 )); then
+    return 1
+  fi
+  if (( sig_found == 0 )); then
+    echo "No signature files were downloaded from MinIO for selected timestamps" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Mirror may return an absolute URL or a path-only next link.
+mirror_resolve_next_url() {
+  local base="$1"
+  local next="$2"
+  if [[ -z "${next}" ]]; then
+    echo ""
+    return 0
+  fi
+  if [[ "${next}" == http://* || "${next}" == https://* ]]; then
+    echo "${next}"
+    return 0
+  fi
+  if [[ "${next}" == /* ]]; then
+    local origin
+    origin="$(echo "${base}" | sed -E 's|(https?://[^/]+).*|\1|')"
+    echo "${origin}${next}"
+    return 0
+  fi
+  echo "${base%/}/${next}"
+}
+
+# Paginate mirror /api/v1/blocks (ascending), collect unique record file basenames for blocks with number <= max_block.
+collect_record_filenames_up_to_block() {
+  local mirror_base="$1"
+  local max_block="$2"
+  local out_file="$3"
+  local next_url="${mirror_base%/}/api/v1/blocks?order=asc&limit=100"
+  local j last_num count
+  : >"${out_file}"
+  while [[ -n "${next_url}" ]]; do
+    j="$(curl -sf "${next_url}")" || return 1
+    count="$(echo "${j}" | jq '.blocks | length')"
+    if [[ "${count}" == "0" || "${count}" == "null" ]]; then
+      break
+    fi
+    echo "${j}" | jq -r --argjson max "${max_block}" '
+      .blocks[]
+      | select(.number <= $max)
+      | (.name // empty)
+      | split("/")
+      | last
+      | select(length > 0)
+    ' >>"${out_file}"
+    last_num="$(echo "${j}" | jq -r '.blocks[-1].number')"
+    if [[ "${last_num}" == "null" ]]; then
+      break
+    fi
+    if (( last_num >= max_block )); then
+      break
+    fi
+    next_url="$(mirror_resolve_next_url "${mirror_base}" "$(echo "${j}" | jq -r '.links.next // empty')")"
+  done
+  sort -u "${out_file}" -o "${out_file}"
+}
+
+# Download record stream objects from the Solo MinIO bucket (default solo-streams) whose basenames appear
+# on blocks <= max_block in the mirror (same names as /api/v1/blocks[].name).
+download_solo_minio_record_streams() {
+  local max_block="$1"
+  local mirror_base="$2"
+  local names_file svc svc_port nfiles
+
+  mkdir -p "${RECORD_STREAMS_DIR}"
+  names_file="$(mktemp)"
+  log "Collecting record stream file names from mirror for blocks <= ${max_block}"
+  collect_record_filenames_up_to_block "${mirror_base}" "${max_block}" "${names_file}" || {
+    echo "Failed to list blocks from mirror for record file discovery" >&2
+    rm -f "${names_file}"
+    return 1
+  }
+  if [[ ! -s "${names_file}" ]]; then
+    log "No record file names from mirror (empty result); skipping MinIO download"
+    rm -f "${names_file}"
+    return 0
+  fi
+  nfiles="$(wc -l < "${names_file}" | tr -d ' ')"
+  log "Found ${nfiles} unique record stream file name(s) to resolve in MinIO"
+
+  svc="$(minio_discover_service "${MINIO_NAMESPACE}")" || {
+    echo "Could not find a MinIO Service in namespace ${MINIO_NAMESPACE}" >&2
+    rm -f "${names_file}"
+    return 1
+  }
+  svc_port="$(minio_discover_service_port "${MINIO_NAMESPACE}" "${svc}")" || {
+    echo "Could not resolve service port for MinIO service ${svc}" >&2
+    rm -f "${names_file}"
+    return 1
+  }
+
+  if ! download_solo_record_streams_via_pod_mc "${names_file}" "${svc}" "${svc_port}"; then
+    echo "Unable to download from in-pod MinIO fallback in namespace ${MINIO_NAMESPACE}" >&2
+    rm -f "${names_file}"
+    return 1
+  fi
+  rm -f "${names_file}"
+}
+
+local_build_implementation_version() {
+  unzip -p "${LOCAL_BUILD_PATH}/apps/HederaNode.jar" META-INF/MANIFEST.MF 2>/dev/null \
+    | sed -n 's/^Implementation-Version: //p' | head -n 1
+}
+
+consensus_pod_implementation_version() {
+  local pod="$1"
+  kubectl -n "${SOLO_NAMESPACE}" exec "${pod}" -c root-container -- sh -lc \
+    "unzip -p /opt/hgcapp/services-hedera/HapiApp2.0/data/apps/HederaNode.jar META-INF/MANIFEST.MF 2>/dev/null \
+      | sed -n 's/^Implementation-Version: //p' | head -n 1"
+}
+
+configured_wraps_artifacts_container_dir() {
+  local configured=""
+  configured="$(sed -n 's/^TSS_LIB_WRAPS_ARTIFACTS_PATH=//p' "${APP_ENV_073_FILE}" | head -n 1)"
+  if [[ -n "${configured}" ]]; then
+    printf '%s\n' "${configured}"
+  else
+    printf '%s\n' "${WRAPS_ARTIFACTS_CONTAINER_DIR_DEFAULT}"
+  fi
+}
+
+consensus_pod_wraps_env() {
+  local pod="$1"
+  kubectl -n "${SOLO_NAMESPACE}" exec "${pod}" -c root-container -- sh -lc \
+    "pid=\"\$(pgrep -f \"com.hedera.node.app.ServicesMain\" | head -n 1)\";
+     if [[ -n \"\${pid}\" && -r \"/proc/\${pid}/environ\" ]]; then
+       tr \"\\000\" \"\\n\" < \"/proc/\${pid}/environ\" | sed -n \"s/^TSS_LIB_WRAPS_ARTIFACTS_PATH=//p\" | head -n 1
+     fi" 2>/dev/null
+}
+
+consensus_pod_wraps_file_count() {
+  local pod="$1"
+  local wraps_dir="$2"
+  kubectl -n "${SOLO_NAMESPACE}" exec "${pod}" -c root-container -- sh -lc \
+    "find ${wraps_dir} -maxdepth 1 -type f 2>/dev/null | wc -l" 2>/dev/null | tr -d ' '
+}
+
+wraps_runtime_needs_remedy() {
+  local wraps_dir=""
+  local expected_wraps=""
+  local node=""
+  local pod=""
+  local found_env=""
+  local found_wraps=""
+  local nodes=()
+
+  wraps_dir="$(configured_wraps_artifacts_container_dir)"
+  expected_wraps="$(find "${WRAPS_KEY_PATH}" -type f | wc -l | tr -d ' ')"
+
+  IFS=',' read -r -a nodes <<< "${NODE_ALIASES}"
+  for node in "${nodes[@]}"; do
+    pod="network-${node}-0"
+    found_env="$(consensus_pod_wraps_env "${pod}" || true)"
+    found_wraps="$(consensus_pod_wraps_file_count "${pod}" "${wraps_dir}" || true)"
+    log "Verifying WRAPS runtime on ${pod} (expected env ${wraps_dir}, found ${found_env:-unset}; expected ${expected_wraps} files, found ${found_wraps:-0})"
+    if [[ "${found_env}" != "${wraps_dir}" || "${found_wraps}" != "${expected_wraps}" ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+consensus_pod_has_wraps_proof_log() {
+  local pod="$1"
+  kubectl -n "${SOLO_NAMESPACE}" exec "${pod}" -c root-container -- sh -lc \
+    "grep -Eq 'Constructing (genesis|incremental) WRAPS proof with:' ${HAPI_PATH}/output/hgcaa.log" >/dev/null 2>&1
+}
+
+consensus_pod_has_wraps_not_ready_log() {
+  local pod="$1"
+  kubectl -n "${SOLO_NAMESPACE}" exec "${pod}" -c root-container -- sh -lc \
+    "grep -Eq 'WRAPS library is not ready|Skipping publication of POST_AGGREGATION output: WRAPS library is not ready' ${HAPI_PATH}/output/hgcaa.log" >/dev/null 2>&1
+}
+
+verify_wraps_proof_on_consensus_nodes() {
+  local timeout_secs="${1:-120}"
+  local deadline=$((SECONDS + timeout_secs))
+  local node=""
+  local pod=""
+  local nodes=()
+
+  IFS=',' read -r -a nodes <<< "${NODE_ALIASES}"
+  for node in "${nodes[@]}"; do
+    pod="network-${node}-0"
+    log "Waiting for WRAPS proof construction in ${pod} hgcaa.log"
+    while (( SECONDS < deadline )); do
+      if consensus_pod_has_wraps_proof_log "${pod}"; then
+        log "Observed WRAPS proof construction in ${pod}"
+        break
+      fi
+      if consensus_pod_has_wraps_not_ready_log "${pod}"; then
+        log "Detected WRAPS runtime not-ready message in ${pod}"
+        return 1
+      fi
+      sleep 5
+    done
+
+    consensus_pod_has_wraps_proof_log "${pod}" || return 1
+  done
+}
+
+verify_local_build_on_consensus_nodes() {
+  local node pod
+  local nodes=()
+  local local_version=""
+  local pod_version=""
+
+  local_version="$(local_build_implementation_version)"
+  [[ -n "${local_version}" ]] || { echo "Unable to determine local build version for verification" >&2; return 1; }
+
+  IFS=',' read -r -a nodes <<< "${NODE_ALIASES}"
+
+  for node in "${nodes[@]}"; do
+    pod="network-${node}-0"
+    pod_version="$(consensus_pod_implementation_version "${pod}" || true)"
+    log "Verifying local build version on ${pod} (expected ${local_version}, found ${pod_version:-unknown})"
+    [[ "${pod_version}" == "${local_version}" ]]
+  done
+}
+
+upgrade_failed_due_to_copy_error() {
+  local log_file="${SOLO_HOME_DIR}/logs/solo.log"
+  [[ -f "${log_file}" ]] || return 1
+  tail -n 200 "${log_file}" | grep -Eq \
+    'Error in copying local build to node|test -d "/opt/hgcapp/services-hedera/HapiApp2.0/wraps-v0.2.0"'
+}
+
+upgrade_stuck_in_copy_loop() {
+  local log_file="${SOLO_HOME_DIR}/logs/solo.log"
+  local repeated_copy_count
+  [[ -f "${log_file}" ]] || return 1
+
+  repeated_copy_count="$(
+    tail -n 400 "${log_file}" \
+      | grep -Ec 'copyTo: beginning copy .*solo/network-node[0-9]+-0:/opt/hgcapp/services-hedera/HapiApp2.0'
+  )"
+
+  (( repeated_copy_count >= 10 ))
+}
+
+run_command_with_timeout() {
+  local timeout_secs="$1"
+  shift
+
+  local cmd_pid=""
+  local start_ts
+  local elapsed
+
+  "$@" &
+  cmd_pid=$!
+  start_ts="$(date +%s)"
+
+  while kill -0 "${cmd_pid}" >/dev/null 2>&1; do
+    elapsed=$(( $(date +%s) - start_ts ))
+    if (( elapsed >= timeout_secs )); then
+      log "Command exceeded timeout (${timeout_secs}s); terminating PID ${cmd_pid}"
+      pkill -TERM -P "${cmd_pid}" >/dev/null 2>&1 || true
+      kill -TERM "${cmd_pid}" >/dev/null 2>&1 || true
+      sleep 5
+      pkill -KILL -P "${cmd_pid}" >/dev/null 2>&1 || true
+      kill -KILL "${cmd_pid}" >/dev/null 2>&1 || true
+      wait "${cmd_pid}" >/dev/null 2>&1 || true
+      return 124
+    fi
+    sleep 5
+  done
+
+  wait "${cmd_pid}"
+}
+
+run_local_copy_remedy() {
+  [[ -f "${REMEDY_SCRIPT_PATH}" ]] || {
+    echo "Missing remedy script: ${REMEDY_SCRIPT_PATH}" >&2
+    return 1
+  }
+  [[ -d "${WRAPS_KEY_PATH}" ]] || {
+    echo "Missing WRAPS_KEY_PATH directory: ${WRAPS_KEY_PATH}" >&2
+    return 1
+  }
+
+  log "Solo 0.73 upgrade failed with a copy-related error; invoking remedy script"
+  SOLO_DEPLOYMENT="${SOLO_DEPLOYMENT}" \
+  SOLO_NAMESPACE="${SOLO_NAMESPACE}" \
+  NODE_ALIASES="${NODE_ALIASES}" \
+  LOCAL_BUILD_PATH="${LOCAL_BUILD_PATH}" \
+  WRAPS_KEY_PATH="${WRAPS_KEY_PATH}" \
+  WRAPS_ARTIFACTS_CONTAINER_DIR="$(configured_wraps_artifacts_container_dir)" \
+  bash "${REMEDY_SCRIPT_PATH}"
+}
+
+run_073_upgrade_once() {
+  local upgrade_cmd=(
+    solo consensus network upgrade
+    --deployment "${SOLO_DEPLOYMENT}"
+    --node-aliases "${NODE_ALIASES}"
+    --upgrade-version "${UPGRADE_073_VERSION}"
+    --local-build-path "${LOCAL_BUILD_PATH}"
+    --application-properties "${APP_PROPS_073_FILE}"
+    --application-env "${APP_ENV_073_FILE}"
+    --quiet-mode
+    --force
+  )
+  local upgrade_ec=0
+
+  [[ -d "${WRAPS_KEY_PATH}" ]] || {
+    echo "Missing WRAPS_KEY_PATH directory: ${WRAPS_KEY_PATH}" >&2
+    return 1
+  }
+  log "Using WRAPS key path for 0.73 upgrade: ${WRAPS_KEY_PATH}"
+  upgrade_cmd+=(--wraps-key-path "${WRAPS_KEY_PATH}")
+
+  if run_command_with_timeout "${SOLO_073_UPGRADE_TIMEOUT_SECS}" \
+    env NODE_COPY_CONCURRENT="${SOLO_073_NODE_COPY_CONCURRENT}" \
+      LOCAL_BUILD_COPY_RETRY="${SOLO_073_LOCAL_BUILD_COPY_RETRY}" \
+      "${upgrade_cmd[@]}"; then
+    upgrade_ec=0
+  else
+    upgrade_ec=$?
+  fi
+
+  if (( upgrade_ec == 0 )); then
+    :
+  elif upgrade_failed_due_to_copy_error; then
+    run_local_copy_remedy
+  elif upgrade_stuck_in_copy_loop; then
+    log "Solo 0.73 upgrade appears stuck in a local-build copy loop; invoking remedy script"
+    run_local_copy_remedy
+  else
+    return 1
+  fi
+
+  wait_for_consensus_pods_ready 600 || return 1
+  wait_for_haproxy_ready 600 || return 1
+  verify_local_build_on_consensus_nodes || return 1
+  if wraps_runtime_needs_remedy; then
+    log "Detected incomplete WRAPS runtime configuration after 0.73 upgrade; invoking remedy script"
+    run_local_copy_remedy || return 1
+    wait_for_consensus_pods_ready 600 || return 1
+    wait_for_haproxy_ready 600 || return 1
+    verify_local_build_on_consensus_nodes || return 1
+    wraps_runtime_needs_remedy && return 1
+  fi
+  verify_wraps_proof_on_consensus_nodes "${WRAPS_PROOF_TIMEOUT_SECS}" || return 1
+}
+
+run_075_upgrade() {
+  local upgrade_cmd=(
+    solo consensus network upgrade
+    --deployment "${SOLO_DEPLOYMENT}"
+    --node-aliases "${NODE_ALIASES}"
+    --upgrade-version "${UPGRADE_075_VERSION}"
+    --local-build-path "${LOCAL_BUILD_PATH}"
+    --application-properties "${TMP_075_UPGRADE_APP_PROPS}"
+    --quiet-mode
+    --force
+  )
+
+  run_command_with_timeout "${SOLO_075_UPGRADE_TIMEOUT_SECS}" "${upgrade_cmd[@]}"
+  wait_for_consensus_pods_ready 600
+  wait_for_haproxy_ready 600
+  verify_local_build_on_consensus_nodes
+}
+
+run_076_upgrade() {
+  local upgrade_cmd=(
+    solo consensus network upgrade
+    --deployment "${SOLO_DEPLOYMENT}"
+    --node-aliases "${NODE_ALIASES}"
+    --upgrade-version "${UPGRADE_076_VERSION}"
+    --local-build-path "${LOCAL_BUILD_PATH}"
+    --application-properties "${APP_PROPS_076_FILE}"
+    --application-env "${APP_ENV_076_FILE}"
+    --quiet-mode
+    --force
+  )
+
+  run_command_with_timeout "${SOLO_076_UPGRADE_TIMEOUT_SECS}" "${upgrade_cmd[@]}"
+  wait_for_consensus_pods_ready 600
+  wait_for_haproxy_ready 600
+  verify_local_build_on_consensus_nodes
+}
+
+create_temp_075_upgrade_properties() {
+  cp "${APP_PROPS_075_FILE}" "${TMP_075_UPGRADE_APP_PROPS}"
+  {
+    echo ""
+    echo "# Added by solo-e2e-block-stream-cutover.sh from jumpstart.bin"
+    echo "blockStream.jumpstart.blockNum=${JUMPSTART_BLOCK_NUMBER}"
+    echo "blockStream.jumpstart.previousWrappedRecordBlockHash=${JUMPSTART_PREV_WRAPPED_RECORD_BLOCK_HASH}"
+    echo "blockStream.jumpstart.consensusTimestampHash=${JUMPSTART_CONSENSUS_TIMESTAMP_HASH}"
+    echo "blockStream.jumpstart.outputItemsTreeRootHash=${JUMPSTART_OUTPUT_ITEMS_TREE_ROOT_HASH}"
+    echo "blockStream.jumpstart.streamingHasherLeafCount=${JUMPSTART_STREAMING_HASHER_LEAF_COUNT}"
+    echo "blockStream.jumpstart.streamingHasherHashCount=${JUMPSTART_STREAMING_HASHER_HASH_COUNT}"
+    echo "blockStream.jumpstart.streamingHasherSubtreeHashes=${JUMPSTART_STREAMING_HASHER_SUBTREE_HASHES}"
+  } >> "${TMP_075_UPGRADE_APP_PROPS}"
+}
+
+run_explorer_add_with_retry() {
+  local attempt=1
+  local max_attempts="${EXPLORER_ADD_RETRIES}"
+  local delay_secs="${EXPLORER_ADD_RETRY_DELAY_SECS}"
+  local ec=0
+
+  while (( attempt <= max_attempts )); do
+    if solo explorer node add --deployment "${SOLO_DEPLOYMENT}" >/dev/null 2>&1; then
+      return 0
+    fi
+    ec=$?
+    if (( attempt == max_attempts )); then
+      break
+    fi
+    sleep "${delay_secs}"
+    ((attempt++))
+  done
+
+  if [[ "${ALLOW_EXPLORER_DEPLOY_FAILURE}" == "true" ]]; then
+    return 0
+  fi
+
+  return "${ec}"
+}
+
+discover_grafana_service_name() {
+  local svc="${GRAFANA_SERVICE_NAME}"
+
+  if kubectl -n "${SOLO_CLUSTER_SETUP_NAMESPACE}" get svc "${svc}" >/dev/null 2>&1; then
+    printf '%s\n' "${svc}"
+    return 0
+  fi
+  if kubectl -n "${SOLO_CLUSTER_SETUP_NAMESPACE}" get svc grafana >/dev/null 2>&1; then
+    printf '%s\n' "grafana"
+    return 0
+  fi
+
+  svc="$(kubectl -n "${SOLO_CLUSTER_SETUP_NAMESPACE}" get svc -o json 2>/dev/null | jq -r '
+    .items[].metadata.name
+    | select(test("grafana"; "i"))
+  ' | head -n 1)"
+  [[ -n "${svc}" ]] || return 1
+  printf '%s\n' "${svc}"
+}
+
+wait_for_grafana_service_endpoints() {
+  local service_name="$1"
+  local max_attempts="${2:-60}"
+  local attempt=1
+
+  while (( attempt <= max_attempts )); do
+    if kubectl -n "${SOLO_CLUSTER_SETUP_NAMESPACE}" get endpoints "${service_name}" -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null | grep -qE '^[0-9]'; then
+      return 0
+    fi
+    sleep 5
+    ((attempt++))
+  done
+  return 1
+}
+
+start_grafana_port_forward() {
+  local attempt=1
+  local max_attempts=60
+  local grafana_service=""
+
+  if wait_for_http_ok "http://127.0.0.1:${GRAFANA_LOCAL_PORT}/api/health" 1 1; then
+    echo "Grafana port-forward is active on http://127.0.0.1:${GRAFANA_LOCAL_PORT}"
+    return 0
+  fi
+
+  log "Waiting for Grafana service to become available"
+  while (( attempt <= max_attempts )); do
+    if grafana_service="$(discover_grafana_service_name)"; then
+      break
+    fi
+    sleep 5
+    ((attempt++))
+  done
+
+  if (( attempt > max_attempts )); then
+    echo "Timed out waiting for Grafana service in namespace ${SOLO_CLUSTER_SETUP_NAMESPACE} (tried ${GRAFANA_SERVICE_NAME} and auto-discovery)" >&2
+    return 1
+  fi
+
+  if ! wait_for_grafana_service_endpoints "${grafana_service}" 60; then
+    echo "Grafana service ${grafana_service} found but has no ready endpoints in namespace ${SOLO_CLUSTER_SETUP_NAMESPACE}" >&2
+    return 1
+  fi
+  ACTIVE_GRAFANA_SERVICE_NAME="${grafana_service}"
+
+  local pf_attempt=1
+  local pf_max_attempts=6
+  kill_processes_on_local_port "${GRAFANA_LOCAL_PORT}"
+  while (( pf_attempt <= pf_max_attempts )); do
+    nohup kubectl -n "${SOLO_CLUSTER_SETUP_NAMESPACE}" port-forward "svc/${grafana_service}" "${GRAFANA_LOCAL_PORT}:80" >/dev/null 2>&1 < /dev/null &
+    GRAFANA_PORT_FORWARD_PID="$!"
+    disown "${GRAFANA_PORT_FORWARD_PID}" 2>/dev/null || true
+
+    sleep 2
+    if kill -0 "${GRAFANA_PORT_FORWARD_PID}" >/dev/null 2>&1 \
+      && wait_for_http_ok "http://127.0.0.1:${GRAFANA_LOCAL_PORT}/api/health" 10 1; then
+      echo "Grafana port-forward established on http://127.0.0.1:${GRAFANA_LOCAL_PORT}"
+      return 0
+    fi
+
+    [[ -n "${GRAFANA_PORT_FORWARD_PID}" ]] && kill "${GRAFANA_PORT_FORWARD_PID}" >/dev/null 2>&1 || true
+    GRAFANA_PORT_FORWARD_PID=""
+    sleep 2
+    ((pf_attempt++))
+  done
+
+  echo "Failed to establish Grafana port-forward on localhost:${GRAFANA_LOCAL_PORT}" >&2
+  return 1
+}
+
+ensure_grafana_port_forward() {
+  if start_grafana_port_forward; then
+    return 0
+  fi
+
+  if [[ "${ALLOW_GRAFANA_PORT_FORWARD_FAILURE}" == "true" ]]; then
+    echo "WARNING: Grafana port-forward is unavailable; continuing without Grafana tunnel" >&2
+    return 0
+  fi
+
+  echo "Grafana port-forward is required but unavailable." >&2
+  return 1
+}
+
+start_explorer_ingress_port_forward() {
+  local ns svc
+
+  if wait_for_tcp_open "127.0.0.1" "${EXPLORER_INGRESS_LOCAL_PORT}" 1 1; then
+    echo "Explorer ingress port-forward is active on localhost:${EXPLORER_INGRESS_LOCAL_PORT}"
+    return 0
+  fi
+
+  ns="${SOLO_NAMESPACE}"
+  svc="${EXPLORER_INGRESS_SERVICE_NAME}"
+  if ! kubectl -n "${ns}" get svc "${svc}" >/dev/null 2>&1; then
+    echo "Explorer service not found: ${ns}/${svc}" >&2
+    return 1
+  fi
+
+  ACTIVE_INGRESS_NAMESPACE="${ns}"
+  ACTIVE_INGRESS_SERVICE_NAME="${svc}"
+  ACTIVE_INGRESS_REMOTE_PORT="80"
+
+  kill_processes_on_local_port "${EXPLORER_INGRESS_LOCAL_PORT}"
+  nohup kubectl -n "${ns}" port-forward "svc/${svc}" "${EXPLORER_INGRESS_LOCAL_PORT}:80" >/dev/null 2>&1 < /dev/null &
+  EXPLORER_INGRESS_PORT_FORWARD_PID="$!"
+  disown "${EXPLORER_INGRESS_PORT_FORWARD_PID}" 2>/dev/null || true
+  sleep 2
+  if wait_for_tcp_open "127.0.0.1" "${EXPLORER_INGRESS_LOCAL_PORT}" 20 1; then
+    echo "Explorer UI port-forward established: http://127.0.0.1:${EXPLORER_INGRESS_LOCAL_PORT} -> ${ns}/${svc}:80"
+    return 0
+  fi
+  echo "Failed to establish explorer UI port-forward on localhost:${EXPLORER_INGRESS_LOCAL_PORT}" >&2
+  return 1
+}
+
+ensure_solo_service_monitor_for_prometheus() {
+  local attempt=1
+  local max_attempts=20
+
+  while (( attempt <= max_attempts )); do
+    if kubectl -n "${SOLO_NAMESPACE}" get servicemonitor solo-service-monitor >/dev/null 2>&1; then
+      break
+    fi
+    sleep 3
+    ((attempt++))
+  done
+
+  if (( attempt > max_attempts )); then
+    echo "WARNING: solo-service-monitor not found in namespace ${SOLO_NAMESPACE}; consensus metrics may be missing in Grafana." >&2
+    return 0
+  fi
+
+  if ! kubectl -n "${SOLO_NAMESPACE}" label servicemonitor solo-service-monitor release=kube-prometheus-stack --overwrite >/dev/null 2>&1; then
+    echo "WARNING: Failed to add release label to solo-service-monitor." >&2
+    return 0
+  fi
+
+  if ! kubectl -n "${SOLO_NAMESPACE}" patch servicemonitor solo-service-monitor --type merge -p \
+    '{"spec":{"selector":{"matchLabels":{"solo.hedera.com/type":"network-node-svc"}}}}' \
+    >/dev/null 2>&1; then
+    echo "WARNING: Failed to patch solo-service-monitor selector for network-node metrics." >&2
+    return 0
+  fi
+}
+
+start_port_forward_watchdog() {
+  local grafana_service="${ACTIVE_GRAFANA_SERVICE_NAME:-${GRAFANA_SERVICE_NAME}}"
+  local ingress_ns="${ACTIVE_INGRESS_NAMESPACE}"
+  local ingress_svc="${ACTIVE_INGRESS_SERVICE_NAME}"
+  local ingress_remote_port="${ACTIVE_INGRESS_REMOTE_PORT}"
+
+  cat > "${PORT_FORWARD_WATCHDOG_SCRIPT}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+while true; do
+  if ! curl -sf "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/network/nodes" >/dev/null 2>&1; then
+    pkill -f "port-forward svc/${MIRROR_REST_SERVICE} .*${MIRROR_REST_LOCAL_PORT}:http" >/dev/null 2>&1 || true
+    nohup kubectl -n "${SOLO_NAMESPACE}" port-forward "svc/${MIRROR_REST_SERVICE}" "${MIRROR_REST_LOCAL_PORT}:http" >/dev/null 2>&1 < /dev/null &
+  fi
+
+  if command -v nc >/dev/null 2>&1; then
+    nc -z "127.0.0.1" "${CN_GRPC_LOCAL_PORT}" >/dev/null 2>&1 || {
+      pkill -f "port-forward svc/haproxy-node1-svc .*${CN_GRPC_LOCAL_PORT}:non-tls-grpc-client-port" >/dev/null 2>&1 || true
+      nohup kubectl -n "${SOLO_NAMESPACE}" port-forward svc/haproxy-node1-svc "${CN_GRPC_LOCAL_PORT}:non-tls-grpc-client-port" >/dev/null 2>&1 < /dev/null &
+    }
+  else
+    (: </dev/tcp/127.0.0.1/${CN_GRPC_LOCAL_PORT}) >/dev/null 2>&1 || {
+      pkill -f "port-forward svc/haproxy-node1-svc .*${CN_GRPC_LOCAL_PORT}:non-tls-grpc-client-port" >/dev/null 2>&1 || true
+      nohup kubectl -n "${SOLO_NAMESPACE}" port-forward svc/haproxy-node1-svc "${CN_GRPC_LOCAL_PORT}:non-tls-grpc-client-port" >/dev/null 2>&1 < /dev/null &
+    }
+  fi
+
+  if ! curl -sf "http://127.0.0.1:${GRAFANA_LOCAL_PORT}/api/health" >/dev/null 2>&1; then
+    pkill -f "port-forward svc/.*grafana .*${GRAFANA_LOCAL_PORT}:80" >/dev/null 2>&1 || true
+    nohup kubectl -n "${SOLO_CLUSTER_SETUP_NAMESPACE}" port-forward "svc/${grafana_service}" "${GRAFANA_LOCAL_PORT}:80" >/dev/null 2>&1 < /dev/null &
+  fi
+
+  if [[ -n "${ingress_svc}" ]]; then
+    if command -v nc >/dev/null 2>&1; then
+      nc -z "127.0.0.1" "${EXPLORER_INGRESS_LOCAL_PORT}" >/dev/null 2>&1 || {
+        pkill -f "port-forward svc/${ingress_svc} .*${EXPLORER_INGRESS_LOCAL_PORT}:80" >/dev/null 2>&1 || true
+        nohup kubectl -n "${ingress_ns}" port-forward "svc/${ingress_svc}" "${EXPLORER_INGRESS_LOCAL_PORT}:${ingress_remote_port}" >/dev/null 2>&1 < /dev/null &
+      }
+    else
+      (: </dev/tcp/127.0.0.1/${EXPLORER_INGRESS_LOCAL_PORT}) >/dev/null 2>&1 || {
+        pkill -f "port-forward svc/${ingress_svc} .*${EXPLORER_INGRESS_LOCAL_PORT}:80" >/dev/null 2>&1 || true
+        nohup kubectl -n "${ingress_ns}" port-forward "svc/${ingress_svc}" "${EXPLORER_INGRESS_LOCAL_PORT}:${ingress_remote_port}" >/dev/null 2>&1 < /dev/null &
+      }
+    fi
+  fi
+
+  sleep 10
+done
+EOF
+  chmod +x "${PORT_FORWARD_WATCHDOG_SCRIPT}"
+  nohup bash "${PORT_FORWARD_WATCHDOG_SCRIPT}" >"${PORT_FORWARD_WATCHDOG_LOG}" 2>&1 < /dev/null &
+  PORT_FORWARD_WATCHDOG_PID="$!"
+}
+
+start_post_run_keepalive() {
+  if [[ "${KEEP_NETWORK}" != "true" ]]; then
+    return 0
+  fi
+
+  if [[ "${KEEP_PORT_FORWARD_WATCHDOG}" == "true" ]]; then
+    start_port_forward_watchdog
+    echo "Started post-run port-forward watchdog (pid=${PORT_FORWARD_WATCHDOG_PID}, log=${PORT_FORWARD_WATCHDOG_LOG})"
+  fi
+}
+
+discover_prometheus_service_name() {
+  local svc=""
+
+  if kubectl -n "${SOLO_CLUSTER_SETUP_NAMESPACE}" get svc kube-prometheus-stack-prometheus >/dev/null 2>&1; then
+    printf '%s\n' "kube-prometheus-stack-prometheus"
+    return 0
+  fi
+
+  svc="$(kubectl -n "${SOLO_CLUSTER_SETUP_NAMESPACE}" get svc -o json 2>/dev/null | jq -r '
+    .items[].metadata.name
+    | select(test("prometheus"; "i"))
+    | select(test("alertmanager|operator|node-exporter|kube-state-metrics|grafana|pushgateway"; "i") | not)
+  ' | head -n 1)"
+  [[ -n "${svc}" ]] || return 1
+  printf '%s\n' "${svc}"
+}
+
+discover_prometheus_service_port() {
+  local svc="$1"
+  local port=""
+  port="$(kubectl -n "${SOLO_CLUSTER_SETUP_NAMESPACE}" get svc "${svc}" -o json 2>/dev/null | jq -r '
+    first(.spec.ports[] | select(.port == 9090) | .port // empty)
+  ')"
+  if [[ -z "${port}" || "${port}" == "null" ]]; then
+    port="$(kubectl -n "${SOLO_CLUSTER_SETUP_NAMESPACE}" get svc "${svc}" -o json 2>/dev/null | jq -r '
+      first(.spec.ports[] | select((.name // "") | test("http|web"; "i")) | .port // empty)
+    ')"
+  fi
+  if [[ -z "${port}" || "${port}" == "null" ]]; then
+    port="$(kubectl -n "${SOLO_CLUSTER_SETUP_NAMESPACE}" get svc "${svc}" -o json 2>/dev/null | jq -r '.spec.ports[0].port // empty')"
+  fi
+  [[ -n "${port}" && "${port}" != "null" ]] || return 1
+  printf '%s\n' "${port}"
+}
+
+print_end_of_run_diagnostics() {
+  local grafana_health_json=""
+  local grafana_status="unreachable"
+  local ingress_local_status="down"
+  local ingress_target_ns=""
+  local ingress_target_svc=""
+  local ingress_target_port=""
+  local prometheus_svc=""
+  local prometheus_port=""
+  local targets_json=""
+  local active_targets=""
+  local up_targets=""
+  local down_targets=""
+  local dropped_targets=""
+  local down_target_lines=""
+  local prom_sum_up=""
+  local prom_count_up=""
+
+  echo
+  echo "-------------------- End-of-run diagnostics --------------------"
+
+  if grafana_health_json="$(curl -sf "http://127.0.0.1:${GRAFANA_LOCAL_PORT}/api/health" 2>/dev/null)"; then
+    grafana_status="$(echo "${grafana_health_json}" | jq -r '.database // "ok"')"
+    echo "Grafana: reachable on http://127.0.0.1:${GRAFANA_LOCAL_PORT} (database=${grafana_status})"
+  else
+    echo "Grafana: unreachable on http://127.0.0.1:${GRAFANA_LOCAL_PORT}"
+  fi
+
+  if wait_for_tcp_open "127.0.0.1" "${EXPLORER_INGRESS_LOCAL_PORT}" 1 1; then
+    ingress_local_status="up"
+  fi
+  ingress_target_ns="${ACTIVE_INGRESS_NAMESPACE:-unknown}"
+  ingress_target_svc="${ACTIVE_INGRESS_SERVICE_NAME:-unknown}"
+  ingress_target_port="${ACTIVE_INGRESS_REMOTE_PORT:-unknown}"
+  echo "Explorer UI tunnel: local=${EXPLORER_INGRESS_LOCAL_PORT} status=${ingress_local_status} target=${ingress_target_ns}/${ingress_target_svc}:${ingress_target_port}"
+
+  if prometheus_svc="$(discover_prometheus_service_name)" && prometheus_port="$(discover_prometheus_service_port "${prometheus_svc}")"; then
+    if targets_json="$(kubectl get --raw "/api/v1/namespaces/${SOLO_CLUSTER_SETUP_NAMESPACE}/services/http:${prometheus_svc}:${prometheus_port}/proxy/api/v1/targets" 2>/dev/null)"; then
+      active_targets="$(echo "${targets_json}" | jq '[.data.activeTargets[]?] | length')"
+      up_targets="$(echo "${targets_json}" | jq '[.data.activeTargets[]? | select(.health == "up")] | length')"
+      down_targets="$(echo "${targets_json}" | jq '[.data.activeTargets[]? | select(.health != "up")] | length')"
+      dropped_targets="$(echo "${targets_json}" | jq '[.data.droppedTargets[]?] | length')"
+      echo "Prometheus targets: up=${up_targets} down=${down_targets} active=${active_targets} dropped=${dropped_targets} (svc=${SOLO_CLUSTER_SETUP_NAMESPACE}/${prometheus_svc}:${prometheus_port})"
+      if [[ "${down_targets}" != "0" ]]; then
+        down_target_lines="$(echo "${targets_json}" | jq -r '
+          [.data.activeTargets[]? | select(.health != "up")]
+          | .[0:8]
+          | .[]
+          | "  - job=\(.labels.job // "unknown") instance=\(.labels.instance // .discoveredLabels.__address__ // "unknown") state=\(.health // "unknown") lastError=\((.lastError // "none") | tostring)"
+        ')"
+        if [[ -n "${down_target_lines}" ]]; then
+          echo "Prometheus down targets (up to 8):"
+          echo "${down_target_lines}"
+        fi
+      fi
+      prom_sum_up="$(kubectl get --raw "/api/v1/namespaces/${SOLO_CLUSTER_SETUP_NAMESPACE}/services/http:${prometheus_svc}:${prometheus_port}/proxy/api/v1/query?query=sum(up)" 2>/dev/null | jq -r '.data.result[0].value[1] // "n/a"')"
+      prom_count_up="$(kubectl get --raw "/api/v1/namespaces/${SOLO_CLUSTER_SETUP_NAMESPACE}/services/http:${prometheus_svc}:${prometheus_port}/proxy/api/v1/query?query=count(up)" 2>/dev/null | jq -r '.data.result[0].value[1] // "n/a"')"
+      echo "Prometheus query check: sum(up)=${prom_sum_up}, count(up)=${prom_count_up}"
+    else
+      echo "Prometheus targets: query failed via service proxy (svc=${SOLO_CLUSTER_SETUP_NAMESPACE}/${prometheus_svc}:${prometheus_port})"
+    fi
+  else
+    echo "Prometheus targets: service discovery failed in namespace ${SOLO_CLUSTER_SETUP_NAMESPACE}"
+  fi
+
+  echo "----------------------------------------------------------------"
+}
+
+write_sdk_verifier() {
+  cat > "${NODE_SCRIPT}" <<'EOF'
+const { Client, AccountCreateTransaction, PrivateKey, Hbar, Status } = require("@hashgraph/sdk");
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function ensureAccountVisibleInMirror(mirrorUrl, accountId, timeoutMs = 180000, intervalMs = 5000) {
+  const accountPath = `${mirrorUrl.replace(/\/$/, "")}/api/v1/accounts/${accountId}`;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(accountPath);
+      if (response.ok) {
+        return;
+      }
+    } catch (err) {
+      // Mirror may not be ready yet, continue polling.
+    }
+    await sleep(intervalMs);
+  }
+  throw new Error(`Mirror did not report account ${accountId} within timeout`);
+}
+
+async function main() {
+  const grpcEndpoint = process.env.GRPC_ENDPOINT || "127.0.0.1:50211";
+  const mirrorUrl = process.env.MIRROR_REST_URL || "http://127.0.0.1:5551";
+  const mirrorAccountWaitMs = Number(process.env.MIRROR_ACCOUNT_WAIT_MS || "180000");
+  const operatorAccountId = process.env.OPERATOR_ACCOUNT_ID || "0.0.2";
+  const operatorPrivateKey = process.env.OPERATOR_PRIVATE_KEY;
+  if (!operatorPrivateKey) {
+    throw new Error("OPERATOR_PRIVATE_KEY is required");
+  }
+
+  const client = Client.forNetwork({ [grpcEndpoint]: "0.0.3" });
+  client.setOperator(operatorAccountId, PrivateKey.fromString(operatorPrivateKey));
+  client.setMaxAttempts(1);
+  client.setRequestTimeout(15000);
+
+  const tx = new AccountCreateTransaction()
+    .setInitialBalance(new Hbar(1))
+    .setKey(PrivateKey.generateED25519().publicKey)
+    .setMaxTransactionFee(new Hbar(5));
+  const response = await tx.execute(client);
+  const receipt = await response.getReceipt(client);
+
+  if (receipt.status !== Status.Success) {
+    throw new Error(`Expected SUCCESS status but got ${receipt.status.toString()}`);
+  }
+
+  const accountId = receipt.accountId ? receipt.accountId.toString() : "";
+  if (!accountId) {
+    throw new Error("Receipt did not include a new accountId");
+  }
+
+  await ensureAccountVisibleInMirror(mirrorUrl, accountId, mirrorAccountWaitMs);
+  console.log(`PASS: crypto create succeeded and mirror sees account ${accountId}`);
+  await client.close();
+}
+
+main().catch((err) => {
+  console.error(`FAIL: ${err.message}`);
+  process.exit(1);
+});
+EOF
+}
+
+write_sdk_network_probe() {
+  cat > "${NETWORK_PROBE_SCRIPT}" <<'EOF'
+const { Client, AccountBalanceQuery, PrivateKey } = require("@hashgraph/sdk");
+
+async function main() {
+  const grpcEndpoint = process.env.GRPC_ENDPOINT || "127.0.0.1:50211";
+  const operatorAccountId = process.env.OPERATOR_ACCOUNT_ID || "0.0.2";
+  const operatorPrivateKey = process.env.OPERATOR_PRIVATE_KEY;
+  if (!operatorPrivateKey) {
+    throw new Error("OPERATOR_PRIVATE_KEY is required");
+  }
+
+  const client = Client.forNetwork({ [grpcEndpoint]: "0.0.3" });
+  client.setOperator(operatorAccountId, PrivateKey.fromString(operatorPrivateKey));
+  client.setMaxAttempts(1);
+  client.setRequestTimeout(15000);
+
+  const balance = await new AccountBalanceQuery().setAccountId(operatorAccountId).execute(client);
+  console.log(`[sdk-probe] PASS endpoint=${grpcEndpoint} operator=${operatorAccountId} balance=${balance.hbars.toString()}`);
+  await client.close();
+}
+
+main().catch((err) => {
+  const details = err && err.stack ? err.stack : String(err);
+  console.error(`[sdk-probe] FAIL endpoint=${process.env.GRPC_ENDPOINT || "127.0.0.1:50211"} details=${details}`);
+  process.exit(1);
+});
+EOF
+}
+
+write_jumpstart_parser() {
+  cat > "${JUMPSTART_PARSE_SCRIPT}" <<'EOF'
+const fs = require("fs");
+
+function fail(msg) {
+  console.error(`FAIL: ${msg}`);
+  process.exit(1);
+}
+
+const file = process.argv[2];
+if (!file) fail("Missing jumpstart.bin path argument");
+
+let b;
+try {
+  b = fs.readFileSync(file);
+} catch (e) {
+  fail(`Unable to read jumpstart file '${file}': ${e.message}`);
+}
+
+// Layout:
+//   [0..7]    blockNumber                (long, 8 bytes)
+//   [8..55]   previousWrappedBlockHash   (SHA-384, 48 bytes)
+//   [56..103] consensusTimestampHash     (SHA-384, 48 bytes)
+//   [104..151] outputItemsTreeRootHash   (SHA-384, 48 bytes)
+//   [152..159] streamingHasherLeafCount  (long, 8 bytes)
+//   [160..163] streamingHasherHashCount  (int, 4 bytes)
+//   [164..]   streamingHasher subtree hashes (48 bytes each)
+const HEADER_SIZE = 164;
+const HASH_BYTES = 48;
+
+if (b.length < HEADER_SIZE) {
+  fail(`jumpstart.bin too small: ${b.length} bytes (expected at least ${HEADER_SIZE})`);
+}
+
+const blockNum = b.readBigInt64BE(0);
+const prevHash = b.subarray(8, 56).toString("hex");
+const consensusTimestampHash = b.subarray(56, 104).toString("hex");
+const outputItemsTreeRootHash = b.subarray(104, 152).toString("hex");
+const leafCount = b.readBigInt64BE(152);
+const hashCount = b.readInt32BE(160);
+if (hashCount < 0) {
+  fail(`Invalid negative hashCount ${hashCount}`);
+}
+
+const expected = HEADER_SIZE + (hashCount * HASH_BYTES);
+if (b.length !== expected) {
+  fail(`jumpstart.bin size mismatch: got ${b.length}, expected ${expected} (hashCount=${hashCount})`);
+}
+
+const subtreeHashes = [];
+let offset = HEADER_SIZE;
+for (let i = 0; i < hashCount; i += 1) {
+  subtreeHashes.push(b.subarray(offset, offset + HASH_BYTES).toString("hex"));
+  offset += HASH_BYTES;
+}
+
+console.log(`JUMPSTART_BLOCK_NUMBER=${blockNum.toString()}`);
+console.log(`JUMPSTART_PREV_WRAPPED_RECORD_BLOCK_HASH=${prevHash}`);
+console.log(`JUMPSTART_CONSENSUS_TIMESTAMP_HASH=${consensusTimestampHash}`);
+console.log(`JUMPSTART_OUTPUT_ITEMS_TREE_ROOT_HASH=${outputItemsTreeRootHash}`);
+console.log(`JUMPSTART_STREAMING_HASHER_LEAF_COUNT=${leafCount.toString()}`);
+console.log(`JUMPSTART_STREAMING_HASHER_HASH_COUNT=${hashCount}`);
+console.log(`JUMPSTART_STREAMING_HASHER_SUBTREE_HASHES=${subtreeHashes.join(",")}`);
+EOF
+}
+
+write_mirror_metadata_generator() {
+  cat > "${MIRROR_METADATA_SCRIPT}" <<'EOF'
+const fs = require("fs");
+const path = require("path");
+
+const FIRST_BLOCK_TIME = "2019-09-13T21:53:51.396440Z";
+
+function fail(msg) {
+  console.error(`FAIL: ${msg}`);
+  process.exit(1);
+}
+
+function parseTimestampToEpochNanos(tsLike) {
+  const ts = String(tsLike).replace(/_/g, ":");
+  const m = ts.match(
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z$/
+  );
+  if (!m) {
+    throw new Error(`Invalid timestamp format: ${tsLike}`);
+  }
+  const [
+    ,
+    y,
+    mo,
+    d,
+    h,
+    mi,
+    s,
+    fracRaw = "",
+  ] = m;
+  const ms = Date.UTC(
+    Number(y),
+    Number(mo) - 1,
+    Number(d),
+    Number(h),
+    Number(mi),
+    Number(s)
+  );
+  const epochSeconds = BigInt(Math.floor(ms / 1000));
+  const fracNanos = BigInt((fracRaw + "000000000").slice(0, 9));
+  return (epochSeconds * 1_000_000_000n) + fracNanos;
+}
+
+function recordNameToEpochNanos(recordName) {
+  const base = path.basename(String(recordName));
+  const z = base.indexOf("Z");
+  if (z < 0) {
+    throw new Error(`Record file name does not include Z timestamp: ${recordName}`);
+  }
+  const ts = base.slice(0, z + 1);
+  return parseTimestampToEpochNanos(ts);
+}
+
+function resolveNextUrl(base, next) {
+  if (!next) {
+    return "";
+  }
+  if (next.startsWith("http://") || next.startsWith("https://")) {
+    return next;
+  }
+  if (next.startsWith("/")) {
+    return `${base}${next}`;
+  }
+  return `${base}/${next}`;
+}
+
+async function fetchAllBlocksUpTo(mirrorBase, maxBlock) {
+  const blocks = [];
+  let nextUrl = `${mirrorBase}/api/v1/blocks?order=asc&limit=100`;
+  while (nextUrl) {
+    const response = await fetch(nextUrl);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} from ${nextUrl}`);
+    }
+    const body = await response.json();
+    const page = Array.isArray(body.blocks) ? body.blocks : [];
+    if (page.length === 0) {
+      break;
+    }
+
+    for (const b of page) {
+      const n = Number(b.number);
+      if (!Number.isFinite(n)) {
+        continue;
+      }
+      if (n > maxBlock) {
+        return blocks;
+      }
+      blocks.push({
+        number: n,
+        name: b.name || "",
+        hash: String(b.hash || "").replace(/^0x/i, ""),
+      });
+    }
+
+    const lastNumber = Number(page[page.length - 1].number);
+    if (Number.isFinite(lastNumber) && lastNumber >= maxBlock) {
+      break;
+    }
+    nextUrl = resolveNextUrl(mirrorBase, body.links && body.links.next);
+  }
+  return blocks;
+}
+
+function ensureNoBlockGaps(sortedBlocks) {
+  if (sortedBlocks.length < 2) {
+    return;
+  }
+  for (let i = 1; i < sortedBlocks.length; i += 1) {
+    const expected = sortedBlocks[i - 1].number + 1;
+    const actual = sortedBlocks[i].number;
+    if (actual !== expected) {
+      throw new Error(`Gap in mirror blocks: expected ${expected}, got ${actual}`);
+    }
+  }
+}
+
+function dayFromRecordName(recordName) {
+  const base = path.basename(String(recordName));
+  const z = base.indexOf("Z");
+  if (z < 0) {
+    throw new Error(`Record file name does not include Z timestamp: ${recordName}`);
+  }
+  const ts = base.slice(0, z + 1).replace(/_/g, ":");
+  return ts.slice(0, 10);
+}
+
+async function main() {
+  const mirrorBase = String(process.env.MIRROR_REST_URL || "http://127.0.0.1:5551").replace(/\/$/, "");
+  const maxBlockRaw = process.env.MIRROR_BLOCK_NUMBER;
+  const blockTimesFile = process.env.BLOCK_TIMES_FILE;
+  const dayBlocksFile = process.env.DAY_BLOCKS_FILE;
+  if (!maxBlockRaw) fail("MIRROR_BLOCK_NUMBER is required");
+  if (!blockTimesFile) fail("BLOCK_TIMES_FILE is required");
+  if (!dayBlocksFile) fail("DAY_BLOCKS_FILE is required");
+
+  const maxBlock = Number(maxBlockRaw);
+  if (!Number.isInteger(maxBlock) || maxBlock < 0) {
+    fail(`Invalid MIRROR_BLOCK_NUMBER: ${maxBlockRaw}`);
+  }
+
+  const blocks = await fetchAllBlocksUpTo(mirrorBase, maxBlock);
+  if (blocks.length === 0) {
+    fail("Mirror returned no blocks for metadata generation");
+  }
+  blocks.sort((a, b) => a.number - b.number);
+  ensureNoBlockGaps(blocks);
+  const highest = blocks[blocks.length - 1].number;
+  if (highest < maxBlock) {
+    fail(`Mirror highest fetched block ${highest} is below requested ${maxBlock}`);
+  }
+
+  const firstEpochNanos = parseTimestampToEpochNanos(FIRST_BLOCK_TIME);
+  const buf = Buffer.alloc((maxBlock + 1) * 8);
+  const byDay = new Map();
+
+  for (const b of blocks) {
+    const epochNanos = recordNameToEpochNanos(b.name);
+    const blockTime = epochNanos - firstEpochNanos;
+    if (blockTime < 0n) {
+      fail(`Negative block time for block ${b.number} (${b.name})`);
+    }
+    buf.writeBigInt64BE(blockTime, b.number * 8);
+
+    const day = dayFromRecordName(b.name);
+    const [year, month, dayNum] = day.split("-").map(Number);
+    const prev = byDay.get(day);
+    if (!prev) {
+      byDay.set(day, {
+        year,
+        month,
+        day: dayNum,
+        firstBlockNumber: b.number,
+        firstBlockHash: b.hash,
+        lastBlockNumber: b.number,
+        lastBlockHash: b.hash,
+      });
+    } else {
+      prev.lastBlockNumber = b.number;
+      prev.lastBlockHash = b.hash;
+    }
+  }
+
+  fs.mkdirSync(path.dirname(blockTimesFile), { recursive: true });
+  fs.mkdirSync(path.dirname(dayBlocksFile), { recursive: true });
+  fs.writeFileSync(blockTimesFile, buf);
+
+  const dayBlocks = Array.from(byDay.values()).sort((a, b) => {
+    if (a.year !== b.year) return a.year - b.year;
+    if (a.month !== b.month) return a.month - b.month;
+    return a.day - b.day;
+  });
+  fs.writeFileSync(dayBlocksFile, `${JSON.stringify(dayBlocks, null, 2)}\n`);
+
+  console.log(
+    `PASS: generated ${blockTimesFile} (${maxBlock + 1} entries) and ${dayBlocksFile} (${dayBlocks.length} day entries)`
+  );
+}
+
+main().catch((err) => {
+  console.error(`FAIL: ${err.message}`);
+  process.exit(1);
+});
+EOF
+}
+
+generate_block_node_metadata_from_mirror() {
+  local max_block="$1"
+  write_mirror_metadata_generator
+
+  export MIRROR_BLOCK_NUMBER="${max_block}"
+  export BLOCK_TIMES_FILE
+  export DAY_BLOCKS_FILE
+  export MIRROR_REST_URL
+
+  if ! node "${MIRROR_METADATA_SCRIPT}" >/dev/null 2>&1; then
+    echo "Mirror metadata generation failed" >&2
+    return 1
+  fi
+}
+
+prepare_wrap_day_archives_from_record_streams() {
+  local account_dir account_id src base ts day
+  local out_dir out_file stem stem_no_ext
+  local primary_records=0
+  local other_records=0
+  local sig_files=0
+  local tar_count=0
+
+  rm -rf "${WRAP_DAYS_SRC_DIR}" "${WRAP_COMPRESSED_DAYS_DIR}" >/dev/null 2>&1 || true
+  mkdir -p "${WRAP_DAYS_SRC_DIR}" "${WRAP_COMPRESSED_DAYS_DIR}"
+
+  shopt -s nullglob
+  for account_dir in "${RECORD_STREAMS_DIR}"/record0.0.*; do
+    [[ -d "${account_dir}" ]] || continue
+    account_id="${account_dir##*/record}"
+    for src in "${account_dir}"/*; do
+      [[ -f "${src}" ]] || continue
+      base="$(basename "${src}")"
+      [[ "${base}" == *Z* ]] || continue
+      ts="${base%%Z*}Z"
+      day="${ts%%T*}"
+      out_dir="${WRAP_DAYS_SRC_DIR}/${day}/${ts}"
+      mkdir -p "${out_dir}"
+
+      case "${base}" in
+        *.rcd.gz)
+          stem="${base%.gz}"
+          stem_no_ext="${stem%.rcd}"
+          if [[ "${stem_no_ext}" == "${ts}" && "${account_id}" == "0.0.3" && ! -f "${out_dir}/${ts}.rcd" ]]; then
+            gzip -dc "${src}" > "${out_dir}/${ts}.rcd"
+            primary_records=$((primary_records + 1))
+          else
+            out_file="${out_dir}/${stem_no_ext}_node_${account_id}.rcd"
+            gzip -dc "${src}" > "${out_file}"
+            other_records=$((other_records + 1))
+          fi
+          ;;
+        *.rcd)
+          stem_no_ext="${base%.rcd}"
+          if [[ "${stem_no_ext}" == "${ts}" && "${account_id}" == "0.0.3" && ! -f "${out_dir}/${ts}.rcd" ]]; then
+            cp -f "${src}" "${out_dir}/${ts}.rcd"
+            primary_records=$((primary_records + 1))
+          else
+            cp -f "${src}" "${out_dir}/${stem_no_ext}_node_${account_id}.rcd"
+            other_records=$((other_records + 1))
+          fi
+          ;;
+        *.rcd_sig)
+          stem_no_ext="${base%.rcd_sig}"
+          cp -f "${src}" "${out_dir}/${stem_no_ext}_node_${account_id}.rcd_sig"
+          sig_files=$((sig_files + 1))
+          ;;
+        *.rcs_sig)
+          stem_no_ext="${base%.rcs_sig}"
+          cp -f "${src}" "${out_dir}/${stem_no_ext}_node_${account_id}.rcs_sig"
+          sig_files=$((sig_files + 1))
+          ;;
+      esac
+    done
+  done
+  shopt -u nullglob
+
+  if (( primary_records == 0 )); then
+    echo "No primary record files prepared for wrap input under ${WRAP_DAYS_SRC_DIR}" >&2
+    return 1
+  fi
+  if (( sig_files == 0 )); then
+    echo "No signature files prepared for wrap input under ${WRAP_DAYS_SRC_DIR}" >&2
+    return 1
+  fi
+
+  if ! (
+    cd "${BLOCK_NODE_REPO_PATH}" && ./gradlew :tools:run --args="days compress -o ${WRAP_COMPRESSED_DAYS_DIR} ${WRAP_DAYS_SRC_DIR}"
+  ) >/dev/null 2>&1; then
+    echo "Failed to build .tar.zstd wrap input archives" >&2
+    return 1
+  fi
+
+  tar_count="$(find "${WRAP_COMPRESSED_DAYS_DIR}" -type f -name '*.tar.zstd' | wc -l | tr -d ' ')"
+  if [[ "${tar_count}" == "0" ]]; then
+    echo "days compress produced no .tar.zstd files under ${WRAP_COMPRESSED_DAYS_DIR}" >&2
+    return 1
+  fi
+}
+
+run_block_node_wrap_tool() {
+  local records_dir="$1"
+  local wrapped_dir="$2"
+  local wrap_args jumpstart_file
+
+  if [[ "${USE_BLOCK_NODE_JUMPSTART}" != "true" ]]; then
+    log "USE_BLOCK_NODE_JUMPSTART=false; skipping Block Node wrap tool and using configured jumpstart env values"
+    return 0
+  fi
+
+  if ! validate_block_node_repo; then
+    return 1
+  fi
+  if [[ ! -d "${records_dir}" ]]; then
+    echo "recordStreams directory not found: ${records_dir}" >&2
+    return 1
+  fi
+  if ! ensure_zstd_command_for_block_node; then
+    echo "Failed to provide a working zstd command for Block Node wrapping." >&2
+    return 1
+  fi
+
+  mkdir -p "${wrapped_dir}"
+  wrap_args="blocks wrap -i ${records_dir} -o ${wrapped_dir} --blocktimes-file ${BLOCK_TIMES_FILE} --day-blocks ${DAY_BLOCKS_FILE}"
+  if [[ -n "${BLOCKS_WRAP_EXTRA_ARGS}" ]]; then
+    wrap_args="${wrap_args} ${BLOCKS_WRAP_EXTRA_ARGS}"
+  fi
+
+  if ! (
+    cd "${BLOCK_NODE_REPO_PATH}" && ./gradlew :tools:run --args="${wrap_args}"
+  ) >/dev/null 2>&1; then
+    echo "Block Node wrap command failed" >&2
+    return 1
+  fi
+
+  if [[ -n "${JUMPSTART_BIN_PATH}" ]]; then
+    jumpstart_file="${JUMPSTART_BIN_PATH}"
+  else
+    jumpstart_file="$(find "${wrapped_dir}" -type f -name "jumpstart.bin" | head -n 1)"
+  fi
+  if [[ -z "${jumpstart_file}" || ! -f "${jumpstart_file}" ]]; then
+    echo "jumpstart.bin not found under ${wrapped_dir}. Override with JUMPSTART_BIN_PATH." >&2
+    return 1
+  fi
+
+  export JUMPSTART_BIN_PATH="${jumpstart_file}"
+}
+
+load_jumpstart_env_from_bin() {
+  local jumpstart_file="$1"
+  local k v
+
+  [[ -f "${jumpstart_file}" ]] || { echo "jumpstart.bin not found: ${jumpstart_file}" >&2; return 1; }
+  write_jumpstart_parser
+
+  while IFS='=' read -r k v; do
+    case "${k}" in
+      JUMPSTART_BLOCK_NUMBER) JUMPSTART_BLOCK_NUMBER="${v}" ;;
+      JUMPSTART_PREV_WRAPPED_RECORD_BLOCK_HASH) JUMPSTART_PREV_WRAPPED_RECORD_BLOCK_HASH="${v}" ;;
+      JUMPSTART_STREAMING_HASHER_LEAF_COUNT) JUMPSTART_STREAMING_HASHER_LEAF_COUNT="${v}" ;;
+      JUMPSTART_STREAMING_HASHER_HASH_COUNT) JUMPSTART_STREAMING_HASHER_HASH_COUNT="${v}" ;;
+      JUMPSTART_STREAMING_HASHER_SUBTREE_HASHES) JUMPSTART_STREAMING_HASHER_SUBTREE_HASHES="${v}" ;;
+    esac
+  done < <(node "${JUMPSTART_PARSE_SCRIPT}" "${jumpstart_file}")
+
+  [[ -n "${JUMPSTART_BLOCK_NUMBER}" ]] || { echo "Failed to parse JUMPSTART_BLOCK_NUMBER from ${jumpstart_file}" >&2; return 1; }
+  [[ -n "${JUMPSTART_PREV_WRAPPED_RECORD_BLOCK_HASH}" ]] || { echo "Failed to parse previous hash from ${jumpstart_file}" >&2; return 1; }
+  [[ -n "${JUMPSTART_STREAMING_HASHER_LEAF_COUNT}" ]] || { echo "Failed to parse leaf count from ${jumpstart_file}" >&2; return 1; }
+  [[ -n "${JUMPSTART_STREAMING_HASHER_HASH_COUNT}" ]] || { echo "Failed to parse hash count from ${jumpstart_file}" >&2; return 1; }
+  [[ -n "${JUMPSTART_STREAMING_HASHER_SUBTREE_HASHES}" || "${JUMPSTART_STREAMING_HASHER_HASH_COUNT}" == "0" ]] || {
+    echo "Failed to parse subtree hashes from ${jumpstart_file}" >&2
+    return 1
+  }
+
+  export JUMPSTART_BLOCK_NUMBER
+  export JUMPSTART_PREV_WRAPPED_RECORD_BLOCK_HASH
+  export JUMPSTART_STREAMING_HASHER_LEAF_COUNT
+  export JUMPSTART_STREAMING_HASHER_HASH_COUNT
+  export JUMPSTART_STREAMING_HASHER_SUBTREE_HASHES
+
+}
+
+prepare_js_sdk_runtime() {
+  write_sdk_verifier
+  write_sdk_network_probe
+  cd "${WORK_DIR}"
+  npm init -y >/dev/null 2>&1
+  npm install --no-fund --no-audit @hashgraph/sdk >/dev/null 2>&1
+
+  export GRPC_ENDPOINT="127.0.0.1:${CN_GRPC_LOCAL_PORT}"
+  export MIRROR_REST_URL="http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}"
+  export OPERATOR_ACCOUNT_ID
+  export OPERATOR_PRIVATE_KEY
+}
+
+write_mirror_node_values_override() {
+  cat > "${MIRROR_NODE_VALUES_FILE}" <<EOF
+restjava:
+  resources:
+    requests:
+      memory: ${MIRROR_RESTJAVA_MEMORY_REQUEST}
+    limits:
+      memory: ${MIRROR_RESTJAVA_MEMORY_LIMIT}
+EOF
+}
+
+deploy_mirror_node_for_cutover() {
+  local ec=0
+  write_mirror_node_values_override
+  if solo mirror node add \
+    --deployment "${SOLO_DEPLOYMENT}" \
+    --enable-ingress \
+    --pinger \
+    --values-file "${MIRROR_NODE_VALUES_FILE}"; then
+    return 0
+  fi
+  ec=$?
+
+  if ! mirror_node_failed_only_on_restjava; then
+    return "${ec}"
+  fi
+
+  log "Mirror node add failed only on REST Java readiness; waiting for required mirror services"
+  wait_for_required_mirror_services_ready 600 || return "${ec}"
+  log "Required mirror services are ready; continuing without REST Java"
+}
+
+require_cmd kind
+require_cmd kubectl
+require_cmd solo
+require_cmd npm
+require_cmd node
+require_cmd curl
+require_cmd jq
+require_cmd java
+
+if [[ "${USE_BLOCK_NODE_JUMPSTART}" == "true" ]]; then
+  if ! validate_block_node_repo; then
+    exit 1
+  fi
+fi
+
+if [[ ! -f "${LOG4J2_XML_PATH}" ]]; then
+  echo "log4j2 config not found: ${LOG4J2_XML_PATH}" >&2
+  exit 1
+fi
+if [[ ! -f "${APP_PROPS_073_FILE}" ]]; then
+  echo "application.properties file not found: ${APP_PROPS_073_FILE}" >&2
+  exit 1
+fi
+if [[ ! -f "${APP_PROPS_074_FILE}" ]]; then
+  echo "application.properties file not found: ${APP_PROPS_074_FILE}" >&2
+  exit 1
+fi
+if [[ ! -f "${APP_PROPS_075_FILE}" ]]; then
+  echo "application.properties file not found: ${APP_PROPS_075_FILE}" >&2
+  exit 1
+fi
+if [[ ! -f "${APP_PROPS_076_FILE}" ]]; then
+  echo "application.properties file not found: ${APP_PROPS_076_FILE}" >&2
+  exit 1
+fi
+if [[ ! -x "${REPO_ROOT}/gradlew" ]]; then
+  echo "Missing executable gradlew: ${REPO_ROOT}/gradlew" >&2
+  exit 1
+fi
+
+# Full reset: clear any stale Grafana tunnel before recreating the cluster.
+cleanup_stale_port_forwards true
+print_banner "Step 1/7: Create fresh kind cluster and Solo deployment"
+kind delete cluster -n "${SOLO_CLUSTER_NAME}" >/dev/null 2>&1 || true
+cleanup_record_stream_files_only
+rm -rf "${WRAPPED_BLOCKS_DIR}" >/dev/null 2>&1 || true
+
+kind create cluster -n "${SOLO_CLUSTER_NAME}"
+
+solo cluster-ref config connect --cluster-ref kind-${SOLO_CLUSTER_NAME} --context kind-${SOLO_CLUSTER_NAME}
+solo deployment config delete --deployment "${SOLO_DEPLOYMENT}" --quiet-mode >/dev/null 2>&1 || true
+solo deployment config create -n "${SOLO_NAMESPACE}" --deployment "${SOLO_DEPLOYMENT}"
+solo deployment cluster attach --deployment "${SOLO_DEPLOYMENT}" --cluster-ref kind-${SOLO_CLUSTER_NAME} --num-consensus-nodes "${CONSENSUS_NODE_COUNT}"
+solo cluster-ref config setup -s "${SOLO_CLUSTER_SETUP_NAMESPACE}" --prometheus-stack true
+ensure_grafana_port_forward
+
+print_banner "Step 2/7: Deploy consensus network at ${INITIAL_RELEASE_TAG} (v0.73.0)"
+solo keys consensus generate --gossip-keys --tls-keys --deployment "${SOLO_DEPLOYMENT}" -i "${NODE_ALIASES}"
+solo consensus network deploy --deployment "${SOLO_DEPLOYMENT}" -i "${NODE_ALIASES}" --application-properties "${APP_PROPS_073_FILE}" --log4j2-xml "${LOG4J2_XML_PATH}" --service-monitor true --pod-log true --pvcs true --release-tag "${INITIAL_RELEASE_TAG}"
+solo consensus node setup --deployment "${SOLO_DEPLOYMENT}" -i "${NODE_ALIASES}" --release-tag "${INITIAL_RELEASE_TAG}"
+solo consensus node start --deployment "${SOLO_DEPLOYMENT}" -i "${NODE_ALIASES}"
+wait_for_consensus_pods_ready 600
+wait_for_haproxy_ready 600
+ensure_solo_service_monitor_for_prometheus
+
+print_banner "Step 3/7: Deploy mirror/explorer and validate baseline transactions"
+deploy_mirror_node_for_cutover
+run_explorer_add_with_retry
+if ! start_explorer_ingress_port_forward; then
+  echo "WARNING: Explorer UI tunnel is unavailable; explorer may be inaccessible after run." >&2
+fi
+
+restart_post_upgrade_port_forwards
+ensure_grafana_port_forward
+
+wait_for_http_ok "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/network/nodes" 60 5
+prepare_js_sdk_runtime
+
+node "${NODE_SCRIPT}"
+sleep 45
+
+print_banner "Step 4/7: Upgrade consensus network to ${UPGRADE_074_RELEASE_TAG} with 0.74 properties"
+solo consensus network upgrade --deployment "${SOLO_DEPLOYMENT}" --node-aliases "${NODE_ALIASES}" --upgrade-version "${UPGRADE_074_RELEASE_TAG}" --quiet-mode --force --application-properties "${APP_PROPS_074_FILE}"
+
+wait_for_consensus_pods_ready 600
+wait_for_haproxy_ready 600
+
+restart_post_upgrade_port_forwards
+ensure_grafana_port_forward
+wait_for_http_ok "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/network/nodes" 60 5
+
+export MIRROR_ACCOUNT_WAIT_MS="${MIRROR_ACCOUNT_WAIT_MS:-600000}"
+node "${NODE_SCRIPT}"
+
+sleep 30
+
+print_banner "Step 5/7: Generate jumpstart data via wrapped record block tooling"
+MIRROR_BLOCKS_JSON="$(curl -sf "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/blocks?order=desc&limit=1")" || {
+  echo "Failed to GET /api/v1/blocks from mirror REST" >&2
+  exit 1
+}
+MIRROR_BLOCK_NUMBER="$(echo "${MIRROR_BLOCKS_JSON}" | jq -r '.blocks[0].number')"
+if [[ -z "${MIRROR_BLOCK_NUMBER}" || "${MIRROR_BLOCK_NUMBER}" == "null" ]]; then
+  echo "Could not parse latest block number from mirror response" >&2
+  exit 1
+fi
+export MIRROR_BLOCK_NUMBER
+
+download_solo_minio_record_streams "${MIRROR_BLOCK_NUMBER}" "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}"
+prepare_wrap_day_archives_from_record_streams
+generate_block_node_metadata_from_mirror "${MIRROR_BLOCK_NUMBER}"
+run_block_node_wrap_tool "${WRAP_COMPRESSED_DAYS_DIR}" "${WRAPPED_BLOCKS_DIR}"
+
+if [[ "${USE_BLOCK_NODE_JUMPSTART}" == "true" ]]; then
+  load_jumpstart_env_from_bin "${JUMPSTART_BIN_PATH}"
+else
+  export JUMPSTART_BLOCK_NUMBER="${MIRROR_BLOCK_NUMBER}"
+fi
+
+print_banner "Step 6/8: Build temp 0.75 properties from jumpstart.bin and upgrade local build as ${UPGRADE_075_VERSION}"
+create_temp_075_upgrade_properties
+sleep 30
+# TODO Need to deploy a BN
+# Record Stream -> WRBs ingest in MN
+# Update MN importer after the CN upgrade
+#
+#you’ll need the following in a mirror.yaml file
+#importer:
+#  env:
+#    HIERO_MIRROR_IMPORTER_BLOCK_NODES_0_HOST: 'block-node-1.${SOLO_NAMESPACE}.svc.cluster.local'
+#    HIERO_MIRROR_IMPORTER_BLOCK_CUTOVER_ENABLED: 'true'
+#    HIERO_MIRROR_IMPORTER_BLOCK_CUTOVER_FIRSTSTAGE_ENABLED: 'true'pass it to solo mirror node add … -f mirror.yaml
+#if you want to test WRBs streaming with a CN release before 0.75.0, e..g, 0.74.0, set the following as well
+#HIERO_MIRROR_IMPORTER_BLOCK_CUTOVER_FIRSTSTAGE_HAPIVERSION: '0.74.0'
+#[9:34 AM]solo may add additional configs in its deploy logic when a block node is already deployed, which can mess up the config
+#if so, you can always patch mirrornode config, scale down importer, clean up database, and scale importer back up as a hack.
+# [9:35 AM]note the above needs at least MN 0.153.1, and we also have 0.154.0 just tagged yesterday
+run_075_upgrade
+
+print_banner "Step 7/8: Upgrade local build with 0.76 properties as ${UPGRADE_076_VERSION}"
+sleep 30
+# Still streaming WRBs but TSS is enabled, force mock signatures
+run_076_upgrade
+
+
+# ? 0.77 WRBs -> Block Stream BLOCKS only actual cutover
+
+print_banner "Step 8/8: Post-upgrade readiness and end-to-end transaction verification"
+wait_for_consensus_pods_ready 600
+wait_for_haproxy_ready 600
+restart_post_upgrade_port_forwards
+ensure_grafana_port_forward
+verify_local_build_on_consensus_nodes
+wait_for_http_ok "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/network/nodes" 60 5
+export MIRROR_ACCOUNT_WAIT_MS="${MIRROR_ACCOUNT_WAIT_MS:-600000}"
+node "${NODE_SCRIPT}"
+start_post_run_keepalive
+print_end_of_run_diagnostics
+print_banner "Completed: block stream cutover scenario finished successfully"
