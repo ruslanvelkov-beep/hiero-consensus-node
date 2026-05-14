@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Block Stream Cutover
 #- [ ] Deploy v0.73.0 with application.properties
+#- [ ] Deploy MN and explorer
 #- [ ] Upgrade to v0.74.0-rc.1 with application.properties
 #- [ ] Produce jumpstart.bin via block-node wrapping tool (offline)
+#- [ ] Deploy BN with firs managed block jumpstart block + 1000
 #- [ ] Build temp upgrade properties using parsed jumpstart values
 #- [ ] Upgrade to local build as v0.75.0 with application.properties and jumpstart values
 #- [ ] Upgrade to v0.76.0 -> (*Maybe streaming WRBs to BNs here)
@@ -54,6 +56,17 @@ Options:
                     If omitted, NODE_ALIASES env var (or default node1,node2,node3,node4) is used.
 Environment:
   BLOCK_NODE_REPO_PATH      Path to hiero-block-node checkout (default: ../hiero-block-node)
+  BLOCK_NODE_CUTOVER_START_BLOCK
+                            Block number at which the Block Node joins the chain. Rendered into the BN
+                            pod as BOTH env vars in the same helm values file:
+                              BLOCK_NODE_EARLIEST_MANAGED_BLOCK (NodeConfig.earliestManagedBlock)
+                              BACKFILL_START_BLOCK              (BackfillConfiguration.startBlock)
+                            Defaults at Step 6 time to JUMPSTART_BLOCK_NUMBER + 1000. The +1000 margin
+                            keeps earliestManagedBlock ABOVE CN's current block-stream block number,
+                            so BN's catch-up path (streamBeforeEmbOrElse) snaps nextUnstreamed down
+                            to whatever CN first publishes via the CAS in LiveStreamPublisherManager.
+                            Without these the BN expects block 0 next and rejects every publish with
+                            NODE_BEHIND_PUBLISHER, leaving the BN permanently empty.
   USE_BLOCK_NODE_JUMPSTART  true|false (default: true)
   BLOCKS_WRAP_EXTRA_ARGS    Extra args appended to `blocks wrap ...`
   JUMPSTART_BIN_PATH        Optional explicit jumpstart.bin path (if tool writes elsewhere)
@@ -67,19 +80,26 @@ Environment:
                             (default: resources/0.76/application.properties next to this script)
   UPGRADE_074_RELEASE_TAG    Solo release tag for the intermediate upgrade (default: v0.74.0-rc.1)
   UPGRADE_075_VERSION        Solo upgrade-version for the local-build jumpstart step
-                            Placeholder value required by Solo; local build is used regardless
-                            (default: v0.73.0)
+                            Placeholder value required by Solo; local build is used regardless.
+                            Must be strictly newer than the currently-deployed tag and must not
+                            collide with an existing release tag Solo can resolve.
+                            (default: v0.74.0-rc.2)
   UPGRADE_076_VERSION        Solo upgrade-version for the local-build 0.76 step
-                            Placeholder value required by Solo; local build is used regardless
-                            (default: v0.73.0)
+                            Placeholder value required by Solo; local build is used regardless.
+                            Must be strictly newer than UPGRADE_075_VERSION and must not
+                            collide with an existing release tag Solo can resolve.
+                            (default: v0.74.0-rc.3)
   SOLO_075_UPGRADE_TIMEOUT_SECS  Timeout for the 0.75 local-build upgrade (default: 900)
   SOLO_076_UPGRADE_TIMEOUT_SECS  Timeout for the 0.76 local-build upgrade (default: 900)
   KEEP_PORT_FORWARD_WATCHDOG true|false; keep CN/mirror/grafana forwards healthy post-run (default: true)
-  EXPLORER_INGRESS_LOCAL_PORT Local port for explorer UI tunnel (default: 38081)
+  EXPLORER_INGRESS_LOCAL_PORT Local port for explorer UI tunnel (default: 38080)
+                            Matches Solo's own persist-port-forward for the explorer pod (38080 -> 8080),
+                            so our forward short-circuits to Solo's auto-managed tunnel when present.
   EXPLORER_INGRESS_SERVICE_NAME Explorer service name (default: hiero-explorer-1-solo)
-  EXPLORER_ADD_RETRIES           Retry count for explorer chart deployment in baseline setup (default: 3)
-  EXPLORER_ADD_RETRY_DELAY_SECS  Delay between explorer deployment retries (default: 20)
-  ALLOW_EXPLORER_DEPLOY_FAILURE  true|false, continue baseline when explorer deploy fails after retries (default: true)
+  START_STEP                 Step number to resume from (1..11; default: 1).
+                            Skips earlier steps; caller is responsible for cluster state matching
+                            the end of step (START_STEP - 1). When >1, a resume prelude rebuilds
+                            the SDK runtime and re-establishes the CN/mirror port-forwards.
 EOF
       exit 0
       ;;
@@ -120,19 +140,10 @@ APP_PROPS_076_FILE="${APP_PROPS_076_FILE:-${SCRIPT_DIR}/resources/0.76/applicati
 APP_ENV_076_FILE="${APP_ENV_076_FILE:-${SCRIPT_DIR}/resources/0.76/application.env}"
 INITIAL_RELEASE_TAG="${INITIAL_RELEASE_TAG:-v0.73.0}"
 UPGRADE_074_RELEASE_TAG="${UPGRADE_074_RELEASE_TAG:-v0.74.0-rc.1}"
-UPGRADE_075_VERSION="${UPGRADE_075_VERSION:-v0.73.0}"
-UPGRADE_076_VERSION="${UPGRADE_076_VERSION:-v0.73.0}"
-SOLO_HOME_DIR="${HOME}/.solo"
-HAPI_PATH="/opt/hgcapp/services-hedera/HapiApp2.0"
-WRAPS_ARTIFACTS_CONTAINER_DIR_DEFAULT="${HAPI_PATH}/keys/wraps"
-# After "Update node configuration files", Solo Helm-rolls pods then kubectl-cp's LOCAL_BUILD_PATH in parallel (Solo default 4).
-# On kind, concurrent large copies can hit pods still in Failed/Terminating — serialize copies unless overridden.
+UPGRADE_075_VERSION="${UPGRADE_075_VERSION:-v0.74.0-rc.2}"
+UPGRADE_076_VERSION="${UPGRADE_076_VERSION:-v0.74.0-rc.3}"
 SOLO_075_UPGRADE_TIMEOUT_SECS="${SOLO_075_UPGRADE_TIMEOUT_SECS:-900}"
 SOLO_076_UPGRADE_TIMEOUT_SECS="${SOLO_076_UPGRADE_TIMEOUT_SECS:-900}"
-WRAPS_PROOF_TIMEOUT_SECS="${WRAPS_PROOF_TIMEOUT_SECS:-120}"
-EXPLORER_ADD_RETRIES="${EXPLORER_ADD_RETRIES:-3}"
-EXPLORER_ADD_RETRY_DELAY_SECS="${EXPLORER_ADD_RETRY_DELAY_SECS:-20}"
-ALLOW_EXPLORER_DEPLOY_FAILURE="${ALLOW_EXPLORER_DEPLOY_FAILURE:-true}"
 MIRROR_RESTJAVA_MEMORY_REQUEST="${MIRROR_RESTJAVA_MEMORY_REQUEST:-512Mi}"
 MIRROR_RESTJAVA_MEMORY_LIMIT="${MIRROR_RESTJAVA_MEMORY_LIMIT:-1000Mi}"
 
@@ -160,16 +171,25 @@ MIRROR_REST_LOCAL_PORT="${MIRROR_REST_LOCAL_PORT:-5551}"
 MIRROR_REST_SERVICE="${MIRROR_REST_SERVICE:-mirror-1-rest}"
 GRAFANA_LOCAL_PORT="${GRAFANA_LOCAL_PORT:-3000}"
 GRAFANA_SERVICE_NAME="${GRAFANA_SERVICE_NAME:-kube-prometheus-stack-grafana}"
-EXPLORER_INGRESS_LOCAL_PORT="${EXPLORER_INGRESS_LOCAL_PORT:-38081}"
+EXPLORER_INGRESS_LOCAL_PORT="${EXPLORER_INGRESS_LOCAL_PORT:-38080}"
 EXPLORER_INGRESS_SERVICE_NAME="${EXPLORER_INGRESS_SERVICE_NAME:-hiero-explorer-1-solo}"
 KEEP_NETWORK="${KEEP_NETWORK:-true}"
 # If true, script continues when Grafana forwarding cannot be established.
 ALLOW_GRAFANA_PORT_FORWARD_FAILURE="${ALLOW_GRAFANA_PORT_FORWARD_FAILURE:-true}"
 KEEP_PORT_FORWARD_WATCHDOG="${KEEP_PORT_FORWARD_WATCHDOG:-true}"
 
-# Downloaded record stream objects from Solo MinIO (Step 5), next to this script.
-RECORD_STREAMS_DIR="${RECORD_STREAMS_DIR:-${SCRIPT_DIR}/recordStreams}"
-WRAPPED_BLOCKS_DIR="${WRAPPED_BLOCKS_DIR:-${SCRIPT_DIR}/wrappedBlocks}"
+# Root for generated artifacts (record streams, wrap outputs, comparison logs).
+# This directory is .gitignored so all run-time output stays in one place.
+GENERATED_DIR="${GENERATED_DIR:-${SCRIPT_DIR}/generated}"
+
+# Downloaded record stream objects from Solo MinIO (Step 5).
+RECORD_STREAMS_DIR="${RECORD_STREAMS_DIR:-${GENERATED_DIR}/recordStreams}"
+# Block Node wrap tool output for the initial wrap (Step 5).
+WRAPPED_BLOCKS_DIR="${WRAPPED_BLOCKS_DIR:-${GENERATED_DIR}/wrappedBlocks}"
+# Block Node wrap tool output for the post-0.75 replay used by jumpstart validation (Step 7).
+REPLAY_WRAPPED_BLOCKS_DIR="${REPLAY_WRAPPED_BLOCKS_DIR:-${GENERATED_DIR}/replayWrappedBlocks}"
+# Migration vote vs replay comparison log, written by Step 7.
+MIGRATION_COMPARE_LOG="${MIGRATION_COMPARE_LOG:-${GENERATED_DIR}/migration-compare.log}"
 MINIO_BUCKET="${MINIO_BUCKET:-solo-streams}"
 MINIO_NAMESPACE="${MINIO_NAMESPACE:-${SOLO_NAMESPACE}}"
 # Optional overrides if auto-discovery fails (service name in MINIO_NAMESPACE).
@@ -181,6 +201,47 @@ BLOCK_NODE_REPO_PATH="${BLOCK_NODE_REPO_PATH:-${REPO_ROOT}/../hiero-block-node}"
 BLOCKS_WRAP_EXTRA_ARGS="${BLOCKS_WRAP_EXTRA_ARGS:-}"
 JUMPSTART_BIN_PATH="${JUMPSTART_BIN_PATH:-}"
 
+# Solo-deployed Block Node configuration (Step 6 cutover deployment).
+BLOCK_NODE_ID="${BLOCK_NODE_ID:-1}"
+# Defaults to "<node>=1,..." across NODE_ALIASES if empty.
+BLOCK_NODE_PRIORITY_MAPPING="${BLOCK_NODE_PRIORITY_MAPPING:-}"
+BLOCK_NODE_CHART_DIR="${BLOCK_NODE_CHART_DIR:-}"
+BLOCK_NODE_CHART_VERSION="${BLOCK_NODE_CHART_VERSION:-v0.32.0}"
+BLOCK_NODE_RELEASE_TAG="${BLOCK_NODE_RELEASE_TAG:-}"
+BLOCK_NODE_IMAGE_TAG="${BLOCK_NODE_IMAGE_TAG:-}"
+BLOCK_NODE_VALUES_FILE="${BLOCK_NODE_VALUES_FILE:-}"
+BLOCK_NODE_READY_TIMEOUT_SECS="${BLOCK_NODE_READY_TIMEOUT_SECS:-600}"
+# BLOCK_NODE_CUTOVER_START_BLOCK is rendered into the BN pod as both
+# BLOCK_NODE_EARLIEST_MANAGED_BLOCK (NodeConfig.earliestManagedBlock) and
+# BACKFILL_START_BLOCK (BackfillConfiguration.startBlock). Together they tell
+# the BN it's joining mid-chain at this block: stop expecting genesis, accept
+# the publisher's hash as the new chain root, and only backfill from here
+# upward. Without these (defaults 0) the BN rejects every publish with
+# NODE_BEHIND_PUBLISHER and stays empty.
+# Computed at Step 6 time as JUMPSTART_BLOCK_NUMBER + 1000. The +1000 margin
+# keeps BN's earliestManagedBlock ABOVE CN's current block-stream block at
+# deploy time. When publisher offers a block below earliestManagedBlock,
+# BN's catch-up CAS in streamBeforeEmbOrElse snaps nextUnstreamedBlockNumber
+# down to that block and accepts it. With a too-low margin the publisher's
+# block is ABOVE earliestManagedBlock and BN replies SEND_BEHIND forever.
+# User can override.
+BLOCK_NODE_CUTOVER_START_BLOCK="${BLOCK_NODE_CUTOVER_START_BLOCK:-}"
+
+# Mirror node Block Node cutover overrides (Step 9 mirror reconfiguration).
+# When set, written into the importer env as HIERO_MIRROR_IMPORTER_BLOCK_CUTOVER_FIRSTSTAGE_HAPIVERSION.
+MIRROR_BLOCK_CUTOVER_FIRSTSTAGE_HAPIVERSION="${MIRROR_BLOCK_CUTOVER_FIRSTSTAGE_HAPIVERSION:-}"
+# Mirror node chart version used by `solo mirror node upgrade` in Step 9.
+# Block-cutover env wiring requires MN >= 0.153.1; Solo's default is v0.152.0 which silently ignores the env keys.
+MIRROR_NODE_VERSION="${MIRROR_NODE_VERSION:-v0.154.0}"
+
+# Step at which to start; lower-numbered steps are skipped. Default 1 = full run.
+START_STEP="${START_STEP:-1}"
+if ! [[ "${START_STEP}" =~ ^[1-9]$|^1[01]$ ]]; then
+  echo "START_STEP must be an integer 1..11, got '${START_STEP}'" >&2
+  exit 1
+fi
+should_run_step() { (( START_STEP <= $1 )); }
+
 OPERATOR_ACCOUNT_ID="${OPERATOR_ACCOUNT_ID:-0.0.2}"
 OPERATOR_PRIVATE_KEY="${OPERATOR_PRIVATE_KEY:-302e020100300506032b65700422042091132178e72057a1d7528025956fe39b0b847f200ab59b2fdd367017f3087137}"
 
@@ -190,6 +251,8 @@ NETWORK_PROBE_SCRIPT="${WORK_DIR}/sdk-network-probe.js"
 JUMPSTART_PARSE_SCRIPT="${WORK_DIR}/parse-jumpstart-bin.js"
 TMP_075_UPGRADE_APP_PROPS="${WORK_DIR}/application-075-jumpstart.properties"
 MIRROR_NODE_VALUES_FILE="${WORK_DIR}/mirror-node-cutover-values.yaml"
+MIRROR_NODE_CUTOVER_VALUES_FILE="${WORK_DIR}/mirror-node-block-cutover-values.yaml"
+BLOCK_NODE_CUTOVER_VALUES_FILE="${WORK_DIR}/block-node-cutover-values.yaml"
 BLOCK_TIMES_FILE="${WORK_DIR}/block_times.bin"
 DAY_BLOCKS_FILE="${WORK_DIR}/day_blocks.json"
 MIRROR_METADATA_SCRIPT="${WORK_DIR}/generate-mirror-metadata.js"
@@ -341,14 +404,6 @@ validate_block_node_repo() {
   fi
 }
 
-validate_local_build_path() {
-  local build_path="$1"
-  [[ -d "${build_path}/lib" ]] || { echo "Missing directory: ${build_path}/lib" >&2; return 1; }
-  [[ -d "${build_path}/apps" ]] || { echo "Missing directory: ${build_path}/apps" >&2; return 1; }
-  compgen -G "${build_path}/lib/*.jar" >/dev/null || { echo "No jar files found in ${build_path}/lib" >&2; return 1; }
-  compgen -G "${build_path}/apps/*.jar" >/dev/null || { echo "No jar files found in ${build_path}/apps" >&2; return 1; }
-}
-
 wait_for_http_ok() {
   local url="$1"
   local max_attempts="$2"
@@ -446,14 +501,8 @@ mirror_node_failed_only_on_restjava() {
 }
 
 cleanup_record_stream_files_only() {
-  local removed=0
   mkdir -p "${RECORD_STREAMS_DIR}"
   if [[ -d "${RECORD_STREAMS_DIR}" ]]; then
-    removed="$(find "${RECORD_STREAMS_DIR}" \
-      -type f \
-      -path "${RECORD_STREAMS_DIR}/record0.0.*/*" \
-      \( -name "*.rcd" -o -name "*.rcd.gz" -o -name "*.rcd_sig" -o -name "*.rcs_sig" \) \
-      -print | wc -l | tr -d ' ')"
     find "${RECORD_STREAMS_DIR}" \
       -type f \
       -path "${RECORD_STREAMS_DIR}/record0.0.*/*" \
@@ -625,7 +674,7 @@ download_solo_record_streams_via_pod_mc() {
   local u p selected_u selected_p remote subpath dest
   local server_url cfg_full
   local list_ok=0 endpoint_try
-  local wanted_count selected_count matched_timestamps
+  local wanted_count
   local found=0 sig_found=0 failed=0
 
   pod="$(kubectl -n "${MINIO_NAMESPACE}" get pods -o json 2>/dev/null | jq -r '
@@ -721,19 +770,10 @@ download_solo_record_streams_via_pod_mc() {
       }
     }' "${wanted_timestamps}" "${all_objects}" | sort -u > "${selected_objects}"
 
-  selected_count="$(wc -l < "${selected_objects}" | tr -d ' ')"
-  matched_timestamps="$(awk '{
-    bn = $0;
-    sub(/^.*\//, "", bn);
-    if (match(bn, /Z/)) {
-      print substr(bn, 1, RSTART);
-    }
-  }' "${selected_objects}" | sort -u | wc -l | tr -d ' ')"
-
   while IFS= read -r remote; do
     [[ -z "${remote}" ]] && continue
 
-    subpath="${remote#local/${MINIO_BUCKET}/recordstreams/}"
+    subpath="${remote#local/"${MINIO_BUCKET}"/recordstreams/}"
     if [[ "${subpath}" == "${remote}" ]]; then
       subpath="$(basename "${remote}")"
     fi
@@ -884,97 +924,6 @@ consensus_pod_implementation_version() {
       | sed -n 's/^Implementation-Version: //p' | head -n 1"
 }
 
-configured_wraps_artifacts_container_dir() {
-  local configured=""
-  configured="$(sed -n 's/^TSS_LIB_WRAPS_ARTIFACTS_PATH=//p' "${APP_ENV_073_FILE}" | head -n 1)"
-  if [[ -n "${configured}" ]]; then
-    printf '%s\n' "${configured}"
-  else
-    printf '%s\n' "${WRAPS_ARTIFACTS_CONTAINER_DIR_DEFAULT}"
-  fi
-}
-
-consensus_pod_wraps_env() {
-  local pod="$1"
-  kubectl -n "${SOLO_NAMESPACE}" exec "${pod}" -c root-container -- sh -lc \
-    "pid=\"\$(pgrep -f \"com.hedera.node.app.ServicesMain\" | head -n 1)\";
-     if [[ -n \"\${pid}\" && -r \"/proc/\${pid}/environ\" ]]; then
-       tr \"\\000\" \"\\n\" < \"/proc/\${pid}/environ\" | sed -n \"s/^TSS_LIB_WRAPS_ARTIFACTS_PATH=//p\" | head -n 1
-     fi" 2>/dev/null
-}
-
-consensus_pod_wraps_file_count() {
-  local pod="$1"
-  local wraps_dir="$2"
-  kubectl -n "${SOLO_NAMESPACE}" exec "${pod}" -c root-container -- sh -lc \
-    "find ${wraps_dir} -maxdepth 1 -type f 2>/dev/null | wc -l" 2>/dev/null | tr -d ' '
-}
-
-wraps_runtime_needs_remedy() {
-  local wraps_dir=""
-  local expected_wraps=""
-  local node=""
-  local pod=""
-  local found_env=""
-  local found_wraps=""
-  local nodes=()
-
-  wraps_dir="$(configured_wraps_artifacts_container_dir)"
-  expected_wraps="$(find "${WRAPS_KEY_PATH}" -type f | wc -l | tr -d ' ')"
-
-  IFS=',' read -r -a nodes <<< "${NODE_ALIASES}"
-  for node in "${nodes[@]}"; do
-    pod="network-${node}-0"
-    found_env="$(consensus_pod_wraps_env "${pod}" || true)"
-    found_wraps="$(consensus_pod_wraps_file_count "${pod}" "${wraps_dir}" || true)"
-    log "Verifying WRAPS runtime on ${pod} (expected env ${wraps_dir}, found ${found_env:-unset}; expected ${expected_wraps} files, found ${found_wraps:-0})"
-    if [[ "${found_env}" != "${wraps_dir}" || "${found_wraps}" != "${expected_wraps}" ]]; then
-      return 0
-    fi
-  done
-
-  return 1
-}
-
-consensus_pod_has_wraps_proof_log() {
-  local pod="$1"
-  kubectl -n "${SOLO_NAMESPACE}" exec "${pod}" -c root-container -- sh -lc \
-    "grep -Eq 'Constructing (genesis|incremental) WRAPS proof with:' ${HAPI_PATH}/output/hgcaa.log" >/dev/null 2>&1
-}
-
-consensus_pod_has_wraps_not_ready_log() {
-  local pod="$1"
-  kubectl -n "${SOLO_NAMESPACE}" exec "${pod}" -c root-container -- sh -lc \
-    "grep -Eq 'WRAPS library is not ready|Skipping publication of POST_AGGREGATION output: WRAPS library is not ready' ${HAPI_PATH}/output/hgcaa.log" >/dev/null 2>&1
-}
-
-verify_wraps_proof_on_consensus_nodes() {
-  local timeout_secs="${1:-120}"
-  local deadline=$((SECONDS + timeout_secs))
-  local node=""
-  local pod=""
-  local nodes=()
-
-  IFS=',' read -r -a nodes <<< "${NODE_ALIASES}"
-  for node in "${nodes[@]}"; do
-    pod="network-${node}-0"
-    log "Waiting for WRAPS proof construction in ${pod} hgcaa.log"
-    while (( SECONDS < deadline )); do
-      if consensus_pod_has_wraps_proof_log "${pod}"; then
-        log "Observed WRAPS proof construction in ${pod}"
-        break
-      fi
-      if consensus_pod_has_wraps_not_ready_log "${pod}"; then
-        log "Detected WRAPS runtime not-ready message in ${pod}"
-        return 1
-      fi
-      sleep 5
-    done
-
-    consensus_pod_has_wraps_proof_log "${pod}" || return 1
-  done
-}
-
 verify_local_build_on_consensus_nodes() {
   local node pod
   local nodes=()
@@ -992,26 +941,6 @@ verify_local_build_on_consensus_nodes() {
     log "Verifying local build version on ${pod} (expected ${local_version}, found ${pod_version:-unknown})"
     [[ "${pod_version}" == "${local_version}" ]]
   done
-}
-
-upgrade_failed_due_to_copy_error() {
-  local log_file="${SOLO_HOME_DIR}/logs/solo.log"
-  [[ -f "${log_file}" ]] || return 1
-  tail -n 200 "${log_file}" | grep -Eq \
-    'Error in copying local build to node|test -d "/opt/hgcapp/services-hedera/HapiApp2.0/wraps-v0.2.0"'
-}
-
-upgrade_stuck_in_copy_loop() {
-  local log_file="${SOLO_HOME_DIR}/logs/solo.log"
-  local repeated_copy_count
-  [[ -f "${log_file}" ]] || return 1
-
-  repeated_copy_count="$(
-    tail -n 400 "${log_file}" \
-      | grep -Ec 'copyTo: beginning copy .*solo/network-node[0-9]+-0:/opt/hgcapp/services-hedera/HapiApp2.0'
-  )"
-
-  (( repeated_copy_count >= 10 ))
 }
 
 run_command_with_timeout() {
@@ -1042,81 +971,6 @@ run_command_with_timeout() {
   done
 
   wait "${cmd_pid}"
-}
-
-run_local_copy_remedy() {
-  [[ -f "${REMEDY_SCRIPT_PATH}" ]] || {
-    echo "Missing remedy script: ${REMEDY_SCRIPT_PATH}" >&2
-    return 1
-  }
-  [[ -d "${WRAPS_KEY_PATH}" ]] || {
-    echo "Missing WRAPS_KEY_PATH directory: ${WRAPS_KEY_PATH}" >&2
-    return 1
-  }
-
-  log "Solo 0.73 upgrade failed with a copy-related error; invoking remedy script"
-  SOLO_DEPLOYMENT="${SOLO_DEPLOYMENT}" \
-  SOLO_NAMESPACE="${SOLO_NAMESPACE}" \
-  NODE_ALIASES="${NODE_ALIASES}" \
-  LOCAL_BUILD_PATH="${LOCAL_BUILD_PATH}" \
-  WRAPS_KEY_PATH="${WRAPS_KEY_PATH}" \
-  WRAPS_ARTIFACTS_CONTAINER_DIR="$(configured_wraps_artifacts_container_dir)" \
-  bash "${REMEDY_SCRIPT_PATH}"
-}
-
-run_073_upgrade_once() {
-  local upgrade_cmd=(
-    solo consensus network upgrade
-    --deployment "${SOLO_DEPLOYMENT}"
-    --node-aliases "${NODE_ALIASES}"
-    --upgrade-version "${UPGRADE_073_VERSION}"
-    --local-build-path "${LOCAL_BUILD_PATH}"
-    --application-properties "${APP_PROPS_073_FILE}"
-    --application-env "${APP_ENV_073_FILE}"
-    --quiet-mode
-    --force
-  )
-  local upgrade_ec=0
-
-  [[ -d "${WRAPS_KEY_PATH}" ]] || {
-    echo "Missing WRAPS_KEY_PATH directory: ${WRAPS_KEY_PATH}" >&2
-    return 1
-  }
-  log "Using WRAPS key path for 0.73 upgrade: ${WRAPS_KEY_PATH}"
-  upgrade_cmd+=(--wraps-key-path "${WRAPS_KEY_PATH}")
-
-  if run_command_with_timeout "${SOLO_073_UPGRADE_TIMEOUT_SECS}" \
-    env NODE_COPY_CONCURRENT="${SOLO_073_NODE_COPY_CONCURRENT}" \
-      LOCAL_BUILD_COPY_RETRY="${SOLO_073_LOCAL_BUILD_COPY_RETRY}" \
-      "${upgrade_cmd[@]}"; then
-    upgrade_ec=0
-  else
-    upgrade_ec=$?
-  fi
-
-  if (( upgrade_ec == 0 )); then
-    :
-  elif upgrade_failed_due_to_copy_error; then
-    run_local_copy_remedy
-  elif upgrade_stuck_in_copy_loop; then
-    log "Solo 0.73 upgrade appears stuck in a local-build copy loop; invoking remedy script"
-    run_local_copy_remedy
-  else
-    return 1
-  fi
-
-  wait_for_consensus_pods_ready 600 || return 1
-  wait_for_haproxy_ready 600 || return 1
-  verify_local_build_on_consensus_nodes || return 1
-  if wraps_runtime_needs_remedy; then
-    log "Detected incomplete WRAPS runtime configuration after 0.73 upgrade; invoking remedy script"
-    run_local_copy_remedy || return 1
-    wait_for_consensus_pods_ready 600 || return 1
-    wait_for_haproxy_ready 600 || return 1
-    verify_local_build_on_consensus_nodes || return 1
-    wraps_runtime_needs_remedy && return 1
-  fi
-  verify_wraps_proof_on_consensus_nodes "${WRAPS_PROOF_TIMEOUT_SECS}" || return 1
 }
 
 run_075_upgrade() {
@@ -1168,32 +1022,10 @@ create_temp_075_upgrade_properties() {
     echo "blockStream.jumpstart.streamingHasherLeafCount=${JUMPSTART_STREAMING_HASHER_LEAF_COUNT}"
     echo "blockStream.jumpstart.streamingHasherHashCount=${JUMPSTART_STREAMING_HASHER_HASH_COUNT}"
     echo "blockStream.jumpstart.streamingHasherSubtreeHashes=${JUMPSTART_STREAMING_HASHER_SUBTREE_HASHES}"
+    echo ""
+    echo "# WRB streaming to the Solo-deployed Block Node (Step 6 deployment)."
+    echo "blockNode.blockNodeConnectionFileDir=data/config"
   } >> "${TMP_075_UPGRADE_APP_PROPS}"
-}
-
-run_explorer_add_with_retry() {
-  local attempt=1
-  local max_attempts="${EXPLORER_ADD_RETRIES}"
-  local delay_secs="${EXPLORER_ADD_RETRY_DELAY_SECS}"
-  local ec=0
-
-  while (( attempt <= max_attempts )); do
-    if solo explorer node add --deployment "${SOLO_DEPLOYMENT}" >/dev/null 2>&1; then
-      return 0
-    fi
-    ec=$?
-    if (( attempt == max_attempts )); then
-      break
-    fi
-    sleep "${delay_secs}"
-    ((attempt++))
-  done
-
-  if [[ "${ALLOW_EXPLORER_DEPLOY_FAILURE}" == "true" ]]; then
-    return 0
-  fi
-
-  return "${ec}"
 }
 
 discover_grafana_service_name() {
@@ -1372,7 +1204,7 @@ start_port_forward_watchdog() {
 #!/usr/bin/env bash
 set -euo pipefail
 while true; do
-  if ! curl -sf "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/network/nodes" >/dev/null 2>&1; then
+  if ! curl -sf "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/blocks?limit=1" >/dev/null 2>&1; then
     pkill -f "port-forward svc/${MIRROR_REST_SERVICE} .*${MIRROR_REST_LOCAL_PORT}:http" >/dev/null 2>&1 || true
     nohup kubectl -n "${SOLO_NAMESPACE}" port-forward "svc/${MIRROR_REST_SERVICE}" "${MIRROR_REST_LOCAL_PORT}:http" >/dev/null 2>&1 < /dev/null &
   fi
@@ -1532,7 +1364,14 @@ print_end_of_run_diagnostics() {
 
 write_sdk_verifier() {
   cat > "${NODE_SCRIPT}" <<'EOF'
-const { Client, AccountCreateTransaction, PrivateKey, Hbar, Status } = require("@hashgraph/sdk");
+const {
+  Client,
+  AccountCreateTransaction,
+  Hbar,
+  PrivateKey,
+  Status,
+  TransferTransaction,
+} = require("@hashgraph/sdk");
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -1553,6 +1392,28 @@ async function ensureAccountVisibleInMirror(mirrorUrl, accountId, timeoutMs = 18
     await sleep(intervalMs);
   }
   throw new Error(`Mirror did not report account ${accountId} within timeout`);
+}
+
+// Submits a tiny self-transfer so CN finalises the previous record-stream
+// file and uploads it to MinIO. Without this nudge the cryptoCreate above
+// sits in an unfinished record block forever; mirror only sees a tx after
+// the *next* tx arrives.
+//
+// We sleep for >1 logPeriod (hedera.recordStream.logPeriod = 1s in the deploy
+// app props) before the flush so its consensus timestamp lands in the
+// *next* record block — which is what forces the cryptoCreate's block to
+// close and upload. An immediate flush would just land in the same block.
+async function flushRecordStream(client, operatorAccountId) {
+  await sleep(3000);
+  const flush = new TransferTransaction()
+    .addHbarTransfer(operatorAccountId, Hbar.fromTinybars(-1))
+    .addHbarTransfer(operatorAccountId, Hbar.fromTinybars(1))
+    .setMaxTransactionFee(new Hbar(1));
+  const flushResp = await flush.execute(client);
+  const flushReceipt = await flushResp.getReceipt(client);
+  if (flushReceipt.status !== Status.Success) {
+    throw new Error(`Flush tx returned non-success status: ${flushReceipt.status.toString()}`);
+  }
 }
 
 async function main() {
@@ -1586,8 +1447,10 @@ async function main() {
     throw new Error("Receipt did not include a new accountId");
   }
 
+  await flushRecordStream(client, operatorAccountId);
+
   await ensureAccountVisibleInMirror(mirrorUrl, accountId, mirrorAccountWaitMs);
-  console.log(`PASS: crypto create succeeded and mirror sees account ${accountId}`);
+  console.log(`PASS: crypto create succeeded and mirror node sees account ${accountId}`);
   await client.close();
 }
 
@@ -1909,8 +1772,8 @@ generate_block_node_metadata_from_mirror() {
   export DAY_BLOCKS_FILE
   export MIRROR_REST_URL
 
-  if ! node "${MIRROR_METADATA_SCRIPT}" >/dev/null 2>&1; then
-    echo "Mirror metadata generation failed" >&2
+  if ! node "${MIRROR_METADATA_SCRIPT}" >/dev/null; then
+    echo "Mirror metadata generation failed (stderr shown above)" >&2
     return 1
   fi
 }
@@ -2082,6 +1945,151 @@ load_jumpstart_env_from_bin() {
 
 }
 
+# Migration vote values parsed from hgcaa.log on the consensus pods (Step 7 validation).
+MIGRATION_BLOCK_NUMBER=""
+MIGRATION_PREV_HASH=""
+MIGRATION_INTERMEDIATE_HASHES=""
+MIGRATION_LEAF_COUNT=""
+
+normalize_hash_list() {
+  local input="$1"
+  echo "${input}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' | sed 's/^,//; s/,$//; s/,,*/,/g'
+}
+
+parse_migration_vote_from_hgcaa() {
+  local node pod line="" queued_line="" vote_pod=""
+  local attempt=1 max_attempts=36
+  local nodes=()
+  IFS=',' read -r -a nodes <<< "${NODE_ALIASES}"
+
+  while (( attempt <= max_attempts )); do
+    for node in "${nodes[@]}"; do
+      pod="network-${node}-0"
+      line="$(kubectl -n "${SOLO_NAMESPACE}" exec "${pod}" -c root-container -- sh -lc \
+        "awk '/Finalized migration root hash vote values:/{last=\$0} END{if (last) print last}' /opt/hgcapp/services-hedera/HapiApp2.0/output/hgcaa.log 2>/dev/null" || true)"
+      if [[ -n "${line}" ]]; then
+        vote_pod="${pod}"
+        break
+      fi
+    done
+    if [[ -n "${line}" ]]; then
+      break
+    fi
+    sleep 5
+    ((attempt++))
+  done
+
+  [[ -n "${line}" ]] || {
+    echo "Could not find migration vote finalization log line in hgcaa.log within $((max_attempts * 5))s" >&2
+    return 1
+  }
+
+  if [[ "${line}" =~ Block[[:space:]]+([0-9]+)[[:space:]]+previousWrappedRecordBlockRootHash=([0-9a-fA-F]+),[[:space:]]*wrappedIntermediatePreviousBlockRootHashes=\[([^]]*)\],[[:space:]]*wrappedIntermediateBlockRootsLeafCount=([0-9]+) ]]; then
+    MIGRATION_BLOCK_NUMBER="${BASH_REMATCH[1]}"
+    MIGRATION_PREV_HASH="${BASH_REMATCH[2]}"
+    MIGRATION_INTERMEDIATE_HASHES="${BASH_REMATCH[3]}"
+    MIGRATION_LEAF_COUNT="${BASH_REMATCH[4]}"
+  elif [[ "${line}" =~ previousWrappedRecordBlockRootHash=([0-9a-fA-F]+),[[:space:]]*wrappedIntermediatePreviousBlockRootHashes=\[([^]]*)\],[[:space:]]*wrappedIntermediateBlockRootsLeafCount=([0-9]+) ]]; then
+    MIGRATION_PREV_HASH="${BASH_REMATCH[1]}"
+    MIGRATION_INTERMEDIATE_HASHES="${BASH_REMATCH[2]}"
+    MIGRATION_LEAF_COUNT="${BASH_REMATCH[3]}"
+    queued_line="$(kubectl -n "${SOLO_NAMESPACE}" exec "${vote_pod}" -c root-container -- sh -lc \
+      "awk '/Applied queued hash for block[0-9]+:/{last=\$0} END{if (last) print last}' /opt/hgcapp/services-hedera/HapiApp2.0/output/hgcaa.log 2>/dev/null" || true)"
+    if [[ "${queued_line}" =~ block([0-9]+): ]]; then
+      MIGRATION_BLOCK_NUMBER="${BASH_REMATCH[1]}"
+    else
+      MIGRATION_BLOCK_NUMBER="${JUMPSTART_BLOCK_NUMBER}"
+    fi
+  else
+    echo "Migration vote line did not match expected format: ${line}" >&2
+    return 1
+  fi
+  MIGRATION_PREV_HASH="$(echo "${MIGRATION_PREV_HASH}" | tr '[:upper:]' '[:lower:]')"
+  MIGRATION_INTERMEDIATE_HASHES="$(normalize_hash_list "${MIGRATION_INTERMEDIATE_HASHES}")"
+  echo "Parsed migration vote values: block=${MIGRATION_BLOCK_NUMBER}, leafCount=${MIGRATION_LEAF_COUNT}"
+}
+
+# Re-run the offline wrap from records 0..to_block and load the resulting
+# jumpstart.bin into JUMPSTART_* env (overwriting the Step-5 input values).
+run_replay_wrap_to_075() {
+  local mirror_base="$1"
+  local to_block="$2"
+  local prev_bin_path="${JUMPSTART_BIN_PATH}"
+
+  rm -rf "${RECORD_STREAMS_DIR}" "${REPLAY_WRAPPED_BLOCKS_DIR}" >/dev/null 2>&1 || true
+  mkdir -p "${RECORD_STREAMS_DIR}" "${REPLAY_WRAPPED_BLOCKS_DIR}"
+
+  download_solo_minio_record_streams "${to_block}" "${mirror_base}" || return 1
+  generate_block_node_metadata_from_mirror "${to_block}" || return 1
+  prepare_wrap_day_archives_from_record_streams || return 1
+
+  # Force wrap tool to re-discover jumpstart.bin under the replay output directory.
+  unset JUMPSTART_BIN_PATH
+  if ! run_block_node_wrap_tool "${WRAP_COMPRESSED_DAYS_DIR}" "${REPLAY_WRAPPED_BLOCKS_DIR}"; then
+    export JUMPSTART_BIN_PATH="${prev_bin_path}"
+    return 1
+  fi
+  load_jumpstart_env_from_bin "${JUMPSTART_BIN_PATH}"
+}
+
+compare_replay_to_migration_vote() {
+  local replay_prev replay_leaf replay_hashes
+  local mismatch=0
+  replay_prev="$(echo "${JUMPSTART_PREV_WRAPPED_RECORD_BLOCK_HASH}" | tr '[:upper:]' '[:lower:]')"
+  replay_leaf="${JUMPSTART_STREAMING_HASHER_LEAF_COUNT}"
+  replay_hashes="$(normalize_hash_list "${JUMPSTART_STREAMING_HASHER_SUBTREE_HASHES}")"
+
+  mkdir -p "$(dirname "${MIGRATION_COMPARE_LOG}")"
+  {
+    echo "migration.block=${MIGRATION_BLOCK_NUMBER}"
+    echo "migration.prevHash=${MIGRATION_PREV_HASH}"
+    echo "migration.intermediateHashes=${MIGRATION_INTERMEDIATE_HASHES}"
+    echo "migration.leafCount=${MIGRATION_LEAF_COUNT}"
+    echo "replay.block=${JUMPSTART_BLOCK_NUMBER}"
+    echo "replay.prevHash=${replay_prev}"
+    echo "replay.intermediateHashes=${replay_hashes}"
+    echo "replay.leafCount=${replay_leaf}"
+  } > "${MIGRATION_COMPARE_LOG}"
+
+  echo "--------------------------------------------------------------------"
+  echo "Migration vs Replay Comparison"
+  echo "  blockNumber:"
+  echo "    migration = ${MIGRATION_BLOCK_NUMBER}"
+  echo "    replay    = ${JUMPSTART_BLOCK_NUMBER}"
+  echo "  previousWrappedRecordBlockRootHash:"
+  echo "    migration = ${MIGRATION_PREV_HASH}"
+  echo "    replay    = ${replay_prev}"
+  echo "  wrappedIntermediateBlockRootsLeafCount:"
+  echo "    migration = ${MIGRATION_LEAF_COUNT}"
+  echo "    replay    = ${replay_leaf}"
+  echo "  wrappedIntermediatePreviousBlockRootHashes:"
+  echo "    migration = [${MIGRATION_INTERMEDIATE_HASHES}]"
+  echo "    replay    = [${replay_hashes}]"
+
+  if [[ "${MIGRATION_PREV_HASH}" != "${replay_prev}" ]]; then
+    mismatch=1
+    echo "  mismatch: previousWrappedRecordBlockRootHash differs"
+  fi
+  if [[ "${MIGRATION_INTERMEDIATE_HASHES}" != "${replay_hashes}" ]]; then
+    mismatch=1
+    echo "  mismatch: wrappedIntermediatePreviousBlockRootHashes differ"
+  fi
+  if [[ "${MIGRATION_LEAF_COUNT}" != "${replay_leaf}" ]]; then
+    mismatch=1
+    echo "  mismatch: wrappedIntermediateBlockRootsLeafCount differs"
+  fi
+
+  if (( mismatch == 0 )); then
+    echo "  result: MATCH"
+  else
+    echo "  result: MISMATCH"
+  fi
+  echo "--------------------------------------------------------------------"
+  echo "Comparison log: ${MIGRATION_COMPARE_LOG}"
+
+  (( mismatch == 0 ))
+}
+
 prepare_js_sdk_runtime() {
   write_sdk_verifier
   write_sdk_network_probe
@@ -2112,7 +2120,6 @@ deploy_mirror_node_for_cutover() {
   if solo mirror node add \
     --deployment "${SOLO_DEPLOYMENT}" \
     --enable-ingress \
-    --pinger \
     --values-file "${MIRROR_NODE_VALUES_FILE}"; then
     return 0
   fi
@@ -2125,6 +2132,140 @@ deploy_mirror_node_for_cutover() {
   log "Mirror node add failed only on REST Java readiness; waiting for required mirror services"
   wait_for_required_mirror_services_ready 600 || return "${ec}"
   log "Required mirror services are ready; continuing without REST Java"
+}
+
+build_default_block_node_priority_mapping() {
+  local node mapping=""
+  local nodes=()
+  IFS=',' read -r -a nodes <<< "${NODE_ALIASES}"
+  for node in "${nodes[@]}"; do
+    [[ -n "${mapping}" ]] && mapping+=","
+    mapping+="${node}=1"
+  done
+  echo "${mapping}"
+}
+
+# Writes a helm values file that sets BOTH cutover-related env vars on the
+# block-node-server pod so the BN treats itself as joining mid-chain at the
+# given block:
+#   * BLOCK_NODE_EARLIEST_MANAGED_BLOCK → NodeConfig.earliestManagedBlock
+#       (verification + persistence boundary; bootstraps chain hash from the
+#        first incoming publisher footer instead of demanding ZERO_BLOCK_HASH)
+#   * BACKFILL_START_BLOCK → BackfillConfiguration.startBlock
+#       (backfill plugin floor; below this the BN doesn't try to backfill)
+# Both keys are rendered into the chart ConfigMap
+# (charts/block-node-server/templates/configmap.yaml) and envFrom'd into the
+# pod (charts/block-node-server/templates/statefulset.yaml).
+write_block_node_cutover_values() {
+  cat > "${BLOCK_NODE_CUTOVER_VALUES_FILE}" <<EOF
+blockNode:
+  config:
+    BLOCK_NODE_EARLIEST_MANAGED_BLOCK: "${BLOCK_NODE_CUTOVER_START_BLOCK}"
+    BACKFILL_START_BLOCK: "${BLOCK_NODE_CUTOVER_START_BLOCK}"
+EOF
+}
+
+deploy_block_node_for_cutover() {
+  local add_args=(
+    solo block node add
+    --deployment "${SOLO_DEPLOYMENT}"
+    --cluster-ref "kind-${SOLO_CLUSTER_NAME}"
+    --quiet-mode
+  )
+  [[ -z "${BLOCK_NODE_PRIORITY_MAPPING}" ]] && BLOCK_NODE_PRIORITY_MAPPING="$(build_default_block_node_priority_mapping)"
+  add_args+=(--priority-mapping "${BLOCK_NODE_PRIORITY_MAPPING}")
+  [[ -n "${BLOCK_NODE_CHART_DIR}" ]] && add_args+=(--block-node-chart-dir "${BLOCK_NODE_CHART_DIR}")
+  [[ -n "${BLOCK_NODE_CHART_VERSION}" ]] && add_args+=(--chart-version "${BLOCK_NODE_CHART_VERSION}")
+  [[ -n "${BLOCK_NODE_RELEASE_TAG}" ]] && add_args+=(--release-tag "${BLOCK_NODE_RELEASE_TAG}")
+  [[ -n "${BLOCK_NODE_IMAGE_TAG}" ]] && add_args+=(--image-tag "${BLOCK_NODE_IMAGE_TAG}")
+
+  # Default cutover start block to JUMPSTART_BLOCK_NUMBER+1000. JUMPSTART_BLOCK_NUMBER
+  # is the boundary the wrap tool produced in Step 5 (carried into the 0.75 upgrade
+  # via blockStream.jumpstart.blockNum). The +1000 margin keeps the BN's
+  # earliestManagedBlock ABOVE CN's current block-stream block number, so BN's
+  # catch-up path (streamBeforeEmbOrElse) snaps nextUnstreamed down to whatever
+  # CN first publishes — instead of SEND_BEHIND-ing forever.
+  # Allow user override via env.
+  if [[ -z "${BLOCK_NODE_CUTOVER_START_BLOCK}" ]]; then
+    if [[ -n "${JUMPSTART_BLOCK_NUMBER}" && "${JUMPSTART_BLOCK_NUMBER}" =~ ^[0-9]+$ ]]; then
+      BLOCK_NODE_CUTOVER_START_BLOCK="$((JUMPSTART_BLOCK_NUMBER + 1000))"
+    else
+      echo "Cannot derive BLOCK_NODE_CUTOVER_START_BLOCK: JUMPSTART_BLOCK_NUMBER unset/invalid" >&2
+      echo "Set BLOCK_NODE_CUTOVER_START_BLOCK explicitly, or run from Step 5 so it gets populated." >&2
+      return 1
+    fi
+  fi
+  write_block_node_cutover_values
+  echo "BLOCK_NODE_EARLIEST_MANAGED_BLOCK=${BLOCK_NODE_CUTOVER_START_BLOCK} and BACKFILL_START_BLOCK=${BLOCK_NODE_CUTOVER_START_BLOCK} (BN joins mid-chain at this block)"
+
+  # Solo's --values-file accepts a comma-separated list; layer our cutover
+  # values on top of any user-supplied BLOCK_NODE_VALUES_FILE so user overrides
+  # can still win for non-cutover keys.
+  local values_files="${BLOCK_NODE_CUTOVER_VALUES_FILE}"
+  [[ -n "${BLOCK_NODE_VALUES_FILE}" ]] && values_files="${BLOCK_NODE_VALUES_FILE},${BLOCK_NODE_CUTOVER_VALUES_FILE}"
+  add_args+=(--values-file "${values_files}")
+
+  echo "Deploying Block Node ${BLOCK_NODE_ID} and routing consensus nodes with priority mapping '${BLOCK_NODE_PRIORITY_MAPPING}'"
+  "${add_args[@]}"
+  kubectl -n "${SOLO_NAMESPACE}" wait --for=condition=ready "pod/block-node-${BLOCK_NODE_ID}-0" --timeout="${BLOCK_NODE_READY_TIMEOUT_SECS}s"
+}
+
+write_mirror_node_block_cutover_values() {
+  cat > "${MIRROR_NODE_CUTOVER_VALUES_FILE}" <<EOF
+restjava:
+  resources:
+    requests:
+      memory: ${MIRROR_RESTJAVA_MEMORY_REQUEST}
+    limits:
+      memory: ${MIRROR_RESTJAVA_MEMORY_LIMIT}
+importer:
+  env:
+    HIERO_MIRROR_IMPORTER_BLOCK_NODES_0_HOST: 'block-node-${BLOCK_NODE_ID}.${SOLO_NAMESPACE}.svc.cluster.local'
+    HIERO_MIRROR_IMPORTER_BLOCK_CUTOVER_ENABLED: 'true'
+    HIERO_MIRROR_IMPORTER_BLOCK_CUTOVER_FIRSTSTAGE_ENABLED: 'true'
+EOF
+  if [[ -n "${MIRROR_BLOCK_CUTOVER_FIRSTSTAGE_HAPIVERSION}" ]]; then
+    # Append while preserving indentation under importer.env.
+    printf '    HIERO_MIRROR_IMPORTER_BLOCK_CUTOVER_FIRSTSTAGE_HAPIVERSION: %s\n' \
+      "'${MIRROR_BLOCK_CUTOVER_FIRSTSTAGE_HAPIVERSION}'" >> "${MIRROR_NODE_CUTOVER_VALUES_FILE}"
+  fi
+}
+
+# Reconfigures the already-deployed mirror node to read from the Block Node
+# and enable block-cutover stages. Uses `solo mirror node upgrade` (NOT `add`)
+# because `add` reinstalls the ingress Helm chart with a new release name and
+# collides with the existing haproxy-ingress-1 ownership of the ingress
+# ServiceAccount. `upgrade` reuses the existing release and only diffs values.
+# Also omits --enable-ingress for the same reason; the Step 3 deploy already
+# created it.
+#
+# `--force` is required to bypass Solo's three version gates for block node
+# integration (CN >= v0.72.0, BN >= 0.29.0, MN >= 0.150.0). Without it Solo
+# silently strips the BN/cutover values from the helm upgrade and logs:
+#   "Mirror node will remain configured to pull from consensus node because
+#    version requirements were not met"
+# even when the deployed versions actually satisfy the gates. `--mirror-node-version`
+# is required because Solo's baked-in default (v0.152.0) does not recognize the
+# HIERO_MIRROR_IMPORTER_BLOCK_CUTOVER_* env keys.
+#
+# Note: if importer becomes wedged after this, the documented hack is to patch
+# mirrornode config, scale down importer, clean up its database, and scale it
+# back up.
+update_mirror_node_for_block_cutover() {
+  local upgrade_args=(
+    solo mirror node upgrade
+    --deployment "${SOLO_DEPLOYMENT}"
+    --force
+    --mirror-node-version "${MIRROR_NODE_VERSION}"
+    --values-file "${MIRROR_NODE_CUTOVER_VALUES_FILE}"
+  )
+
+  write_mirror_node_block_cutover_values
+  echo "Upgrading mirror node to ${MIRROR_NODE_VERSION} reading from block-node-${BLOCK_NODE_ID} (cutover enabled, version gates bypassed)"
+  # Solo's `mirror node upgrade` runs its own "Check pods are ready" listr task
+  # before returning success, so we don't need a follow-up readiness wait here.
+  # Under `set -e` a Solo failure already aborts the script.
+  "${upgrade_args[@]}"
 }
 
 require_cmd kind
@@ -2167,122 +2308,163 @@ if [[ ! -x "${REPO_ROOT}/gradlew" ]]; then
   exit 1
 fi
 
-# Full reset: clear any stale Grafana tunnel before recreating the cluster.
-cleanup_stale_port_forwards true
-print_banner "Step 1/7: Create fresh kind cluster and Solo deployment"
-kind delete cluster -n "${SOLO_CLUSTER_NAME}" >/dev/null 2>&1 || true
-cleanup_record_stream_files_only
-rm -rf "${WRAPPED_BLOCKS_DIR}" >/dev/null 2>&1 || true
+if should_run_step 1; then
+  # Full reset: clear any stale Grafana tunnel before recreating the cluster.
+  cleanup_stale_port_forwards true
+  print_banner "Step 1/11: Create fresh kind cluster and Solo deployment"
+  kind delete cluster -n "${SOLO_CLUSTER_NAME}" >/dev/null 2>&1 || true
+  cleanup_record_stream_files_only
+  rm -rf "${WRAPPED_BLOCKS_DIR}" >/dev/null 2>&1 || true
 
-kind create cluster -n "${SOLO_CLUSTER_NAME}"
+  kind create cluster -n "${SOLO_CLUSTER_NAME}"
 
-solo cluster-ref config connect --cluster-ref kind-${SOLO_CLUSTER_NAME} --context kind-${SOLO_CLUSTER_NAME}
-solo deployment config delete --deployment "${SOLO_DEPLOYMENT}" --quiet-mode >/dev/null 2>&1 || true
-solo deployment config create -n "${SOLO_NAMESPACE}" --deployment "${SOLO_DEPLOYMENT}"
-solo deployment cluster attach --deployment "${SOLO_DEPLOYMENT}" --cluster-ref kind-${SOLO_CLUSTER_NAME} --num-consensus-nodes "${CONSENSUS_NODE_COUNT}"
-solo cluster-ref config setup -s "${SOLO_CLUSTER_SETUP_NAMESPACE}" --prometheus-stack true
-ensure_grafana_port_forward
-
-print_banner "Step 2/7: Deploy consensus network at ${INITIAL_RELEASE_TAG} (v0.73.0)"
-solo keys consensus generate --gossip-keys --tls-keys --deployment "${SOLO_DEPLOYMENT}" -i "${NODE_ALIASES}"
-solo consensus network deploy --deployment "${SOLO_DEPLOYMENT}" -i "${NODE_ALIASES}" --application-properties "${APP_PROPS_073_FILE}" --log4j2-xml "${LOG4J2_XML_PATH}" --service-monitor true --pod-log true --pvcs true --release-tag "${INITIAL_RELEASE_TAG}"
-solo consensus node setup --deployment "${SOLO_DEPLOYMENT}" -i "${NODE_ALIASES}" --release-tag "${INITIAL_RELEASE_TAG}"
-solo consensus node start --deployment "${SOLO_DEPLOYMENT}" -i "${NODE_ALIASES}"
-wait_for_consensus_pods_ready 600
-wait_for_haproxy_ready 600
-ensure_solo_service_monitor_for_prometheus
-
-print_banner "Step 3/7: Deploy mirror/explorer and validate baseline transactions"
-deploy_mirror_node_for_cutover
-run_explorer_add_with_retry
-if ! start_explorer_ingress_port_forward; then
-  echo "WARNING: Explorer UI tunnel is unavailable; explorer may be inaccessible after run." >&2
-fi
-
-restart_post_upgrade_port_forwards
-ensure_grafana_port_forward
-
-wait_for_http_ok "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/network/nodes" 60 5
-prepare_js_sdk_runtime
-
-node "${NODE_SCRIPT}"
-sleep 45
-
-print_banner "Step 4/7: Upgrade consensus network to ${UPGRADE_074_RELEASE_TAG} with 0.74 properties"
-solo consensus network upgrade --deployment "${SOLO_DEPLOYMENT}" --node-aliases "${NODE_ALIASES}" --upgrade-version "${UPGRADE_074_RELEASE_TAG}" --quiet-mode --force --application-properties "${APP_PROPS_074_FILE}"
-
-wait_for_consensus_pods_ready 600
-wait_for_haproxy_ready 600
-
-restart_post_upgrade_port_forwards
-ensure_grafana_port_forward
-wait_for_http_ok "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/network/nodes" 60 5
-
-export MIRROR_ACCOUNT_WAIT_MS="${MIRROR_ACCOUNT_WAIT_MS:-600000}"
-node "${NODE_SCRIPT}"
-
-sleep 30
-
-print_banner "Step 5/7: Generate jumpstart data via wrapped record block tooling"
-MIRROR_BLOCKS_JSON="$(curl -sf "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/blocks?order=desc&limit=1")" || {
-  echo "Failed to GET /api/v1/blocks from mirror REST" >&2
-  exit 1
-}
-MIRROR_BLOCK_NUMBER="$(echo "${MIRROR_BLOCKS_JSON}" | jq -r '.blocks[0].number')"
-if [[ -z "${MIRROR_BLOCK_NUMBER}" || "${MIRROR_BLOCK_NUMBER}" == "null" ]]; then
-  echo "Could not parse latest block number from mirror response" >&2
-  exit 1
-fi
-export MIRROR_BLOCK_NUMBER
-
-download_solo_minio_record_streams "${MIRROR_BLOCK_NUMBER}" "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}"
-prepare_wrap_day_archives_from_record_streams
-generate_block_node_metadata_from_mirror "${MIRROR_BLOCK_NUMBER}"
-run_block_node_wrap_tool "${WRAP_COMPRESSED_DAYS_DIR}" "${WRAPPED_BLOCKS_DIR}"
-
-if [[ "${USE_BLOCK_NODE_JUMPSTART}" == "true" ]]; then
-  load_jumpstart_env_from_bin "${JUMPSTART_BIN_PATH}"
+  solo cluster-ref config connect --cluster-ref kind-${SOLO_CLUSTER_NAME} --context kind-${SOLO_CLUSTER_NAME}
+  solo deployment config delete --deployment "${SOLO_DEPLOYMENT}" --quiet-mode >/dev/null 2>&1 || true
+  solo deployment config create -n "${SOLO_NAMESPACE}" --deployment "${SOLO_DEPLOYMENT}"
+  solo deployment cluster attach --deployment "${SOLO_DEPLOYMENT}" --cluster-ref kind-${SOLO_CLUSTER_NAME} --num-consensus-nodes "${CONSENSUS_NODE_COUNT}"
+  solo cluster-ref config setup -s "${SOLO_CLUSTER_SETUP_NAMESPACE}" --prometheus-stack true
+  ensure_grafana_port_forward
 else
-  export JUMPSTART_BLOCK_NUMBER="${MIRROR_BLOCK_NUMBER}"
+  print_banner "Resume mode: START_STEP=${START_STEP}; assuming cluster matches end of step $((START_STEP - 1))"
+  prepare_js_sdk_runtime
+  restart_post_upgrade_port_forwards
+  ensure_grafana_port_forward
 fi
 
-print_banner "Step 6/8: Build temp 0.75 properties from jumpstart.bin and upgrade local build as ${UPGRADE_075_VERSION}"
-create_temp_075_upgrade_properties
-sleep 30
-# TODO Need to deploy a BN
-# Record Stream -> WRBs ingest in MN
-# Update MN importer after the CN upgrade
-#
-#you’ll need the following in a mirror.yaml file
-#importer:
-#  env:
-#    HIERO_MIRROR_IMPORTER_BLOCK_NODES_0_HOST: 'block-node-1.${SOLO_NAMESPACE}.svc.cluster.local'
-#    HIERO_MIRROR_IMPORTER_BLOCK_CUTOVER_ENABLED: 'true'
-#    HIERO_MIRROR_IMPORTER_BLOCK_CUTOVER_FIRSTSTAGE_ENABLED: 'true'pass it to solo mirror node add … -f mirror.yaml
-#if you want to test WRBs streaming with a CN release before 0.75.0, e..g, 0.74.0, set the following as well
-#HIERO_MIRROR_IMPORTER_BLOCK_CUTOVER_FIRSTSTAGE_HAPIVERSION: '0.74.0'
-#[9:34 AM]solo may add additional configs in its deploy logic when a block node is already deployed, which can mess up the config
-#if so, you can always patch mirrornode config, scale down importer, clean up database, and scale importer back up as a hack.
-# [9:35 AM]note the above needs at least MN 0.153.1, and we also have 0.154.0 just tagged yesterday
-run_075_upgrade
+if should_run_step 2; then
+  print_banner "Step 2/11: Deploy consensus network at ${INITIAL_RELEASE_TAG} (v0.73.0)"
+  solo keys consensus generate --gossip-keys --tls-keys --deployment "${SOLO_DEPLOYMENT}" -i "${NODE_ALIASES}"
+  solo consensus network deploy --deployment "${SOLO_DEPLOYMENT}" -i "${NODE_ALIASES}" --application-properties "${APP_PROPS_073_FILE}" --log4j2-xml "${LOG4J2_XML_PATH}" --service-monitor true --pod-log true --pvcs true --release-tag "${INITIAL_RELEASE_TAG}"
+  solo consensus node setup --deployment "${SOLO_DEPLOYMENT}" -i "${NODE_ALIASES}" --release-tag "${INITIAL_RELEASE_TAG}"
+  solo consensus node start --deployment "${SOLO_DEPLOYMENT}" -i "${NODE_ALIASES}"
+  wait_for_consensus_pods_ready 600
+  wait_for_haproxy_ready 600
+  ensure_solo_service_monitor_for_prometheus
+fi
 
-print_banner "Step 7/8: Upgrade local build with 0.76 properties as ${UPGRADE_076_VERSION}"
-sleep 30
-# Still streaming WRBs but TSS is enabled, force mock signatures
-run_076_upgrade
+if should_run_step 3; then
+  print_banner "Step 3/11: Deploy mirror/explorer and validate baseline transactions"
+  deploy_mirror_node_for_cutover
+  solo explorer node add --deployment "${SOLO_DEPLOYMENT}"
+  if ! start_explorer_ingress_port_forward; then
+    echo "WARNING: Explorer UI tunnel is unavailable; explorer may be inaccessible after run." >&2
+  fi
+
+  restart_post_upgrade_port_forwards
+
+  wait_for_http_ok "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/blocks?limit=1" 36 5
+  prepare_js_sdk_runtime
+
+  echo "Testing mirror-node readiness via a simple cryptoCreate (wait up to ${MIRROR_ACCOUNT_WAIT_MS:-180000}ms for mirror visibility)"
+  export MIRROR_ACCOUNT_WAIT_MS="${MIRROR_ACCOUNT_WAIT_MS:-180000}"
+  node "${NODE_SCRIPT}"
+  sleep 45
+fi
+
+if should_run_step 4; then
+  print_banner "Step 4/11: Upgrade consensus network to ${UPGRADE_074_RELEASE_TAG} with 0.74 properties"
+  solo consensus network upgrade --deployment "${SOLO_DEPLOYMENT}" --node-aliases "${NODE_ALIASES}" --upgrade-version "${UPGRADE_074_RELEASE_TAG}" --quiet-mode --force --application-properties "${APP_PROPS_074_FILE}"
+
+  wait_for_consensus_pods_ready 600
+  wait_for_haproxy_ready 600
+
+  restart_post_upgrade_port_forwards
+  wait_for_http_ok "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/blocks?limit=1" 36 5
+
+  echo "Testing mirror-node readiness via a simple cryptoCreate after the 0.74 upgrade (wait up to ${MIRROR_ACCOUNT_WAIT_MS:-180000}ms)"
+  export MIRROR_ACCOUNT_WAIT_MS="${MIRROR_ACCOUNT_WAIT_MS:-180000}"
+  node "${NODE_SCRIPT}"
+
+  sleep 5
+fi
+
+if should_run_step 5; then
+  print_banner "Step 5/11: Generate jumpstart data via wrapped record block tooling"
+  MIRROR_BLOCKS_JSON="$(curl -sf "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/blocks?order=desc&limit=1")" || {
+    echo "Failed to GET /api/v1/blocks from mirror REST" >&2
+    exit 1
+  }
+  MIRROR_BLOCK_NUMBER="$(echo "${MIRROR_BLOCKS_JSON}" | jq -r '.blocks[0].number')"
+  if [[ -z "${MIRROR_BLOCK_NUMBER}" || "${MIRROR_BLOCK_NUMBER}" == "null" ]]; then
+    echo "Could not parse latest block number from mirror response" >&2
+    exit 1
+  fi
+  export MIRROR_BLOCK_NUMBER
+
+  download_solo_minio_record_streams "${MIRROR_BLOCK_NUMBER}" "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}"
+  prepare_wrap_day_archives_from_record_streams
+  generate_block_node_metadata_from_mirror "${MIRROR_BLOCK_NUMBER}"
+  run_block_node_wrap_tool "${WRAP_COMPRESSED_DAYS_DIR}" "${WRAPPED_BLOCKS_DIR}"
+
+  if [[ "${USE_BLOCK_NODE_JUMPSTART}" == "true" ]]; then
+    load_jumpstart_env_from_bin "${JUMPSTART_BIN_PATH}"
+  else
+    export JUMPSTART_BLOCK_NUMBER="${MIRROR_BLOCK_NUMBER}"
+  fi
+fi
+
+if should_run_step 6; then
+  print_banner "Step 6/11: Deploy Block Node ${BLOCK_NODE_ID} and link to consensus nodes"
+  deploy_block_node_for_cutover
+fi
+
+if should_run_step 7; then
+  print_banner "Step 7/11: Build temp 0.75 properties from jumpstart.bin and upgrade local build as ${UPGRADE_075_VERSION} (WRB streaming on)"
+  create_temp_075_upgrade_properties
+  sleep 5
+  run_075_upgrade
+fi
+
+if should_run_step 8; then
+  print_banner "Step 8/11: Validate 0.75 jumpstart by replay vs migration vote"
+  parse_migration_vote_from_hgcaa
+  run_replay_wrap_to_075 "${MIRROR_REST_URL}" "${MIGRATION_BLOCK_NUMBER}"
+  [[ "${JUMPSTART_BLOCK_NUMBER}" == "${MIGRATION_BLOCK_NUMBER}" ]] || {
+    echo "Replay jumpstart block number (${JUMPSTART_BLOCK_NUMBER}) did not match migration block (${MIGRATION_BLOCK_NUMBER})" >&2
+    exit 1
+  }
+  compare_replay_to_migration_vote || {
+    echo "Jumpstart validation failed: migration vote does not match offline replay (see ${MIGRATION_COMPARE_LOG})" >&2
+    exit 1
+  }
+fi
+
+if should_run_step 9; then
+  print_banner "Step 9/11: Update mirror node to read from block-node-${BLOCK_NODE_ID}"
+  update_mirror_node_for_block_cutover
+  echo "Restarting consensus and mirror REST port-forwards"
+  restart_post_upgrade_port_forwards
+  echo "Waiting for mirror REST to respond on http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/blocks?limit=1 (up to 3m)"
+  wait_for_http_ok "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/blocks?limit=1" 36 5
+  # Submit a cryptoCreate via SDK and assert the new account appears in mirror REST.
+  # Validates that the reconfigured importer is reading from the Block Node and
+  # producing accounts queryable through mirror REST after the cutover.
+  echo "Submitting cryptoCreate via SDK and validating mirror visibility (mirror wait up to 3m)"
+  export MIRROR_ACCOUNT_WAIT_MS="${MIRROR_ACCOUNT_WAIT_MS:-180000}"
+  node "${NODE_SCRIPT}"
+fi
+
+#if should_run_step 10; then
+#  print_banner "Step 10/11: Upgrade local build with 0.76 properties as ${UPGRADE_076_VERSION}"
+#  sleep 5
+#  # Still streaming WRBs but TSS is enabled, force mock signatures
+#  run_076_upgrade
+#fi
 
 
 # ? 0.77 WRBs -> Block Stream BLOCKS only actual cutover
 
-print_banner "Step 8/8: Post-upgrade readiness and end-to-end transaction verification"
-wait_for_consensus_pods_ready 600
-wait_for_haproxy_ready 600
-restart_post_upgrade_port_forwards
-ensure_grafana_port_forward
-verify_local_build_on_consensus_nodes
-wait_for_http_ok "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/network/nodes" 60 5
-export MIRROR_ACCOUNT_WAIT_MS="${MIRROR_ACCOUNT_WAIT_MS:-600000}"
-node "${NODE_SCRIPT}"
+if should_run_step 11; then
+  print_banner "Step 11/11: Post-upgrade readiness and end-to-end transaction verification"
+  wait_for_consensus_pods_ready 600
+  wait_for_haproxy_ready 600
+  restart_post_upgrade_port_forwards
+  verify_local_build_on_consensus_nodes
+  wait_for_http_ok "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/blocks?limit=1" 36 5
+  echo "Testing mirror-node readiness via a simple cryptoCreate at end-of-run (wait up to ${MIRROR_ACCOUNT_WAIT_MS:-180000}ms)"
+  export MIRROR_ACCOUNT_WAIT_MS="${MIRROR_ACCOUNT_WAIT_MS:-180000}"
+  node "${NODE_SCRIPT}"
+fi
 start_post_run_keepalive
 print_end_of_run_diagnostics
 print_banner "Completed: block stream cutover scenario finished successfully"
