@@ -35,7 +35,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 @ExtendWith(MockitoExtension.class)
-class V0740BlockRecordSchemaTest {
+class V0750BlockRecordSchemaTest {
     @Mock
     private MigrationContext ctx;
 
@@ -63,7 +63,7 @@ class V0740BlockRecordSchemaTest {
     @Mock
     private WritableSingletonState<BlockInfo> blockInfoState;
 
-    private final V0740BlockRecordSchema subject = new V0740BlockRecordSchema();
+    private final V0750BlockRecordSchema subject = new V0750BlockRecordSchema();
 
     @Test
     void versionIsV0740() {

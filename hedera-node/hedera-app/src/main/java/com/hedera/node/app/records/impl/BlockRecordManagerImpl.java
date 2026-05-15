@@ -502,10 +502,10 @@ public final class BlockRecordManagerImpl implements BlockRecordManager {
             }
 
             final var lastBlockHashBytes = streamFileProducer.getRunningHash();
-            final var justFinishedBlockNumber = lastBlockInfo.lastBlockNumber() + 1;
+            final var justFinishedBlockNumber = lastBlockInfo.lastBlockNumber();
             // log end of block if needed
-            if (logger.isDebugEnabled()) {
-                logger.debug(
+            if (logger.isInfoEnabled()) {
+                logger.info(
                         """
                                 --- BLOCK UPDATE ---
                                   Finished: #{} (started @ {}) with hash {}
@@ -540,6 +540,10 @@ public final class BlockRecordManagerImpl implements BlockRecordManager {
                 .migrationWrappedHashes(wrappedHashesList)
                 .build();
         blockInfoState.put(updatedBlockInfo);
+        logger.info(
+                "Appended migration wrapped record block hashes to state for block {}: {}",
+                justFinishedBlockNumber,
+                wrappedHashes);
         lastBlockInfo = updatedBlockInfo;
     }
 
@@ -926,7 +930,8 @@ public final class BlockRecordManagerImpl implements BlockRecordManager {
         final var queueingEnabled = migrationRootHashVotingQueueingEnabled(state, closedBlockNo);
 
         if (currentBlockStartRunningHash != null) {
-            if ((votingBlockNumInitialized() || votingComplete) && liveWritePrevWrappedRecordHashes()) {
+            if ((votingBlockNumInitialized() || votingComplete) && liveWritePrevWrappedRecordHashes()
+                    || queueingEnabled) {
                 final var wrappedRecordFileBlockHashes =
                         updateWrappedBlockHashes(closedBlockNo, justFinishedBlockCreationTime, hashOfJustFinishedBlock);
                 if (wrappedRecordFileBlockHashes != null && queueingEnabled) {
