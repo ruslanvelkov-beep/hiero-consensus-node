@@ -206,7 +206,7 @@ BLOCK_NODE_ID="${BLOCK_NODE_ID:-1}"
 # Defaults to "<node>=1,..." across NODE_ALIASES if empty.
 BLOCK_NODE_PRIORITY_MAPPING="${BLOCK_NODE_PRIORITY_MAPPING:-}"
 BLOCK_NODE_CHART_DIR="${BLOCK_NODE_CHART_DIR:-}"
-BLOCK_NODE_CHART_VERSION="${BLOCK_NODE_CHART_VERSION:-v0.32.0}"
+BLOCK_NODE_CHART_VERSION="${BLOCK_NODE_CHART_VERSION:-v0.34.0-rc1}"
 BLOCK_NODE_RELEASE_TAG="${BLOCK_NODE_RELEASE_TAG:-}"
 BLOCK_NODE_IMAGE_TAG="${BLOCK_NODE_IMAGE_TAG:-}"
 BLOCK_NODE_VALUES_FILE="${BLOCK_NODE_VALUES_FILE:-}"
@@ -226,6 +226,19 @@ BLOCK_NODE_READY_TIMEOUT_SECS="${BLOCK_NODE_READY_TIMEOUT_SECS:-600}"
 # block is ABOVE earliestManagedBlock and BN replies SEND_BEHIND forever.
 # User can override.
 BLOCK_NODE_CUTOVER_START_BLOCK="${BLOCK_NODE_CUTOVER_START_BLOCK:-}"
+
+# RSA roster bootstrap (BN >= 0.34): without these, BN's RsaRosterBootstrapPlugin has no
+# bootstrap file and no Mirror Node fallback to query, fails fast at startup, and the BN's
+# verifier never receives the CN address book — every WRB block then fails verification with
+# `IllegalStateException: Expected exactly 1 element matching predicate` in
+# ExtendedMerkleTreeSession.finalizeVerification (the missing leaf is the per-node RSA pubkey
+# subtree that the verifier expects to find for each signer in the address book).
+# Mapped to env vars via AutomaticEnvironmentVariableConfigSource (configDataName dots->_,
+# uppercased; camelCase property name uppercased with `_` before each capital).
+ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_BASE_URL="${ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_BASE_URL:-http://${MIRROR_REST_SERVICE}.${SOLO_NAMESPACE}.svc.cluster.local}"
+ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_CONNECT_TIMEOUT_SECONDS="${ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_CONNECT_TIMEOUT_SECONDS:-5}"
+ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_READ_TIMEOUT_SECONDS="${ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_READ_TIMEOUT_SECONDS:-10}"
+ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_PAGE_SIZE="${ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_PAGE_SIZE:-100}"
 
 # Mirror node Block Node cutover overrides (Step 9 mirror reconfiguration).
 # When set, written into the importer env as HIERO_MIRROR_IMPORTER_BLOCK_CUTOVER_FIRSTSTAGE_HAPIVERSION.
@@ -2162,6 +2175,16 @@ blockNode:
   config:
     BLOCK_NODE_EARLIEST_MANAGED_BLOCK: "${BLOCK_NODE_CUTOVER_START_BLOCK}"
     BACKFILL_START_BLOCK: "${BLOCK_NODE_CUTOVER_START_BLOCK}"
+    # RSA roster bootstrap (BN >= 0.34). Mirror Node fallback so the BN can fetch
+    # the consensus node address book (RSA public keys) at startup when no
+    # rsa-bootstrap-roster.json is shipped in the chart. Required for WRB-stream
+    # verification: ExtendedMerkleTreeSession looks up the per-node RSA subtree
+    # leaves by signer entry, and an empty address book makes every block fail
+    # finalizeVerification with "Expected exactly 1 element matching predicate".
+    ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_BASE_URL: "${ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_BASE_URL}"
+    ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_CONNECT_TIMEOUT_SECONDS: "${ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_CONNECT_TIMEOUT_SECONDS}"
+    ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_READ_TIMEOUT_SECONDS: "${ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_READ_TIMEOUT_SECONDS}"
+    ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_PAGE_SIZE: "${ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_PAGE_SIZE}"
 EOF
 }
 
