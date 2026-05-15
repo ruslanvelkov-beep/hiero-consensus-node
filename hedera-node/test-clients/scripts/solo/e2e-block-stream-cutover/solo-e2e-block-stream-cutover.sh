@@ -266,6 +266,7 @@ TMP_075_UPGRADE_APP_PROPS="${WORK_DIR}/application-075-jumpstart.properties"
 MIRROR_NODE_VALUES_FILE="${WORK_DIR}/mirror-node-cutover-values.yaml"
 MIRROR_NODE_CUTOVER_VALUES_FILE="${WORK_DIR}/mirror-node-block-cutover-values.yaml"
 BLOCK_NODE_CUTOVER_VALUES_FILE="${WORK_DIR}/block-node-cutover-values.yaml"
+RSA_BOOTSTRAP_ROSTER_FILE="${WORK_DIR}/rsa-bootstrap-roster.json"
 BLOCK_TIMES_FILE="${WORK_DIR}/block_times.bin"
 DAY_BLOCKS_FILE="${WORK_DIR}/day_blocks.json"
 MIRROR_METADATA_SCRIPT="${WORK_DIR}/generate-mirror-metadata.js"
@@ -2158,33 +2159,167 @@ build_default_block_node_priority_mapping() {
   echo "${mapping}"
 }
 
-# Writes a helm values file that sets BOTH cutover-related env vars on the
-# block-node-server pod so the BN treats itself as joining mid-chain at the
-# given block:
+# Builds the BN RSA bootstrap roster file (PBJ JSON of NodeAddressBook) by
+# extracting the X.509 SubjectPublicKeyInfo from each consensus node's gossip
+# certificate (s-public-node{N}.pem) and hex-encoding the DER bytes.
+#
+# Why this exists: the v0.34.0-rc1 BN chart's plugins.names list does NOT
+# include `roster-bootstrap-rsa`, and `org.hiero.block-node:roster-bootstrap-rsa:0.34.0-rc1`
+# is not published to Maven Central, so the Maven init container never resolves
+# the RsaRosterBootstrapPlugin jar and BN boots without it. With no plugin to
+# fetch the address book from the Mirror Node, BN falls back to reading
+# `app.state.rsaBootstrapFilePath` directly in BlockNodeApp.loadApplicationState()
+# (BEFORE plugin init). Pre-seeding that file is the only way to populate the
+# address book for the WRB verifier in this rc.
+#
+# Using the local mirror REST `/api/v1/network/nodes` is not viable here either:
+# the running mirror returns 404 for that endpoint until the importer ingests an
+# AddressBookUpdate event, which doesn't happen on a fresh local solo deploy.
+# CN's gossip cert files are the authoritative source.
+#
+# Format consumed by RsaKeyDecoder.buildKeyMap (block-node/verification):
+#   rsaPubKey = hex of DER X.509 SubjectPublicKeyInfo (no 0x prefix)
+# PBJ JSON shape (verified empirically against NodeAddressBook.JSON.toBytes):
+#   { "nodeAddress": [ {"RSAPubKey": "..."}, {"nodeId": "1", "RSAPubKey": "..."}, ... ] }
+# Note: nodeId is a STRING and is omitted when 0 (proto default).
+generate_rsa_bootstrap_roster_json() {
+  require_cmd openssl
+  require_cmd xxd
+  local node node_idx node_id pem hex
+  local nodes=()
+  local cn_pod="network-node1-0"
+  local entries=""
+
+  IFS=',' read -r -a nodes <<< "${NODE_ALIASES}"
+  for node in "${nodes[@]}"; do
+    node_idx="${node#node}"             # node3 -> 3 (PEM filename suffix is 1-based)
+    node_id="$((node_idx - 1))"         # JSON nodeId is 0-based
+    pem="$(kubectl -n "${SOLO_NAMESPACE}" exec "${cn_pod}" -c root-container -- \
+      cat "/opt/hgcapp/services-hedera/HapiApp2.0/data/keys/s-public-node${node_idx}.pem" 2>/dev/null || true)"
+    if [[ -z "${pem}" ]]; then
+      echo "Failed to read s-public-node${node_idx}.pem from ${cn_pod}" >&2
+      return 1
+    fi
+    hex="$(printf '%s' "${pem}" \
+      | openssl x509 -pubkey -noout 2>/dev/null \
+      | openssl pkey -pubin -outform DER 2>/dev/null \
+      | xxd -p | tr -d '\n')"
+    if [[ -z "${hex}" ]]; then
+      echo "Failed to extract X.509 SPKI hex for node${node_idx}" >&2
+      return 1
+    fi
+    [[ -n "${entries}" ]] && entries+=","
+    if [[ "${node_id}" == "0" ]]; then
+      entries+=$'\n    {"RSAPubKey": "'"${hex}"'"}'
+    else
+      entries+=$'\n    {"nodeId": "'"${node_id}"'", "RSAPubKey": "'"${hex}"'"}'
+    fi
+  done
+
+  cat > "${RSA_BOOTSTRAP_ROSTER_FILE}" <<EOF
+{
+  "nodeAddress": [${entries}
+  ]
+}
+EOF
+  echo "Generated RSA bootstrap roster (${#nodes[@]} entries): ${RSA_BOOTSTRAP_ROSTER_FILE}"
+}
+
+# Writes a helm values file that sets:
 #   * BLOCK_NODE_EARLIEST_MANAGED_BLOCK → NodeConfig.earliestManagedBlock
 #       (verification + persistence boundary; bootstraps chain hash from the
 #        first incoming publisher footer instead of demanding ZERO_BLOCK_HASH)
 #   * BACKFILL_START_BLOCK → BackfillConfiguration.startBlock
 #       (backfill plugin floor; below this the BN doesn't try to backfill)
-# Both keys are rendered into the chart ConfigMap
+#   * APP_STATE_RSA_BOOTSTRAP_FILE_PATH → ApplicationStateConfig.rsaBootstrapFilePath
+#       (relocated to the live-storage PVC so an init container can seed it
+#        before BlockNodeApp.loadApplicationState() reads it on startup)
+#   * blockNode.initContainers (overridden)
+#       Preserves the chart-default init-storage-dirs step (Helm replaces lists
+#       on values merge, so we must keep it verbatim) and appends a
+#       seed-rsa-bootstrap-roster step that bakes the rsa-bootstrap-roster.json
+#       content into /live-pvc/live-data/ via a quoted-delimiter heredoc. Both
+#       containers mount the live-storage PVC at /live-pvc so writes survive
+#       the BN container's own restart cycles (the container's writable layer
+#       is volatile but the live-data PVC subpath is persistent).
+#
+# All keys under blockNode.config: are rendered into the chart ConfigMap
 # (charts/block-node-server/templates/configmap.yaml) and envFrom'd into the
-# pod (charts/block-node-server/templates/statefulset.yaml).
+# pod (charts/block-node-server/templates/statefulset.yaml). Env-var naming
+# follows AutomaticEnvironmentVariableConfigSource: dots->_, uppercased;
+# camelCase → upper with `_` before each capital.
 write_block_node_cutover_values() {
+  local roster_indented
+  # Indent the JSON body by 10 spaces so it lines up under the YAML `|` block
+  # scalar of the init container's command. The chart's toYaml re-encoder
+  # preserves multi-line string values; the heredoc terminator (ROSTER) appears
+  # at column 0 in the *parsed* YAML string (after the block-scalar's common
+  # indent prefix is stripped), which is exactly where bash needs it.
+  roster_indented="$(sed 's/^/          /' "${RSA_BOOTSTRAP_ROSTER_FILE}")"
+
   cat > "${BLOCK_NODE_CUTOVER_VALUES_FILE}" <<EOF
 blockNode:
   config:
     BLOCK_NODE_EARLIEST_MANAGED_BLOCK: "${BLOCK_NODE_CUTOVER_START_BLOCK}"
     BACKFILL_START_BLOCK: "${BLOCK_NODE_CUTOVER_START_BLOCK}"
-    # RSA roster bootstrap (BN >= 0.34). Mirror Node fallback so the BN can fetch
-    # the consensus node address book (RSA public keys) at startup when no
-    # rsa-bootstrap-roster.json is shipped in the chart. Required for WRB-stream
-    # verification: ExtendedMerkleTreeSession looks up the per-node RSA subtree
-    # leaves by signer entry, and an empty address book makes every block fail
-    # finalizeVerification with "Expected exactly 1 element matching predicate".
+    # Relocate the RSA bootstrap file to the live-data PVC subpath so our
+    # seed-rsa-bootstrap-roster init container (below) can write it in.
+    APP_STATE_RSA_BOOTSTRAP_FILE_PATH: "/opt/hiero/block-node/data/live/rsa-bootstrap-roster.json"
+    # RSA roster bootstrap env vars (BN >= 0.34). Harmless in this rc because
+    # the RsaRosterBootstrapPlugin jar isn't shipped (chart's plugins.names
+    # doesn't list roster-bootstrap-rsa, and the artifact isn't on Maven Central
+    # for v0.34.0-rc1). Left here so that any future rc shipping the plugin
+    # picks them up automatically.
     ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_BASE_URL: "${ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_BASE_URL}"
     ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_CONNECT_TIMEOUT_SECONDS: "${ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_CONNECT_TIMEOUT_SECONDS}"
     ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_READ_TIMEOUT_SECONDS: "${ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_READ_TIMEOUT_SECONDS}"
     ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_PAGE_SIZE: "${ROSTER_BOOTSTRAP_RSA_MIRROR_NODE_PAGE_SIZE}"
+  initContainers:
+    # Verbatim copy of the chart-default init-storage-dirs (charts/block-node-server/values.yaml).
+    # Helm replaces lists on values merge — if we don't preserve this here, the
+    # BN container's writable PVC subpaths never get created/chowned and the
+    # main process fails on its first write to /opt/hiero/block-node/data/live.
+    - name: init-storage-dirs
+      image: busybox
+      command:
+        - sh
+        - -c
+        - |
+          mkdir -p /live-pvc/live-data && \\
+          chown 2000:2000 /live-pvc/live-data && \\
+          chmod 700 /live-pvc/live-data && \\
+          mkdir -p /archive-pvc/archive-data && \\
+          chown 2000:2000 /archive-pvc/archive-data && \\
+          chmod 700 /archive-pvc/archive-data && \\
+          chown 2000:2000 /verification-pvc && \\
+          chmod 700 /verification-pvc
+      volumeMounts:
+        - name: live-storage
+          mountPath: /live-pvc
+        - name: archive-storage
+          mountPath: /archive-pvc
+        - name: verification-storage
+          mountPath: /verification-pvc
+    # Seeds the RSA address book file the BN reads at startup. Quoted-delimiter
+    # heredoc (<<'ROSTER') prevents both shell- and YAML-side substitution of
+    # the JSON payload. Runs after init-storage-dirs (which created live-data
+    # with mode 700/uid 2000) so we can chmod 644 here for read access.
+    - name: seed-rsa-bootstrap-roster
+      image: busybox
+      command:
+        - sh
+        - -c
+        - |
+          cat > /live-pvc/live-data/rsa-bootstrap-roster.json <<'ROSTER'
+${roster_indented}
+          ROSTER
+          chown 2000:2000 /live-pvc/live-data/rsa-bootstrap-roster.json
+          chmod 644 /live-pvc/live-data/rsa-bootstrap-roster.json
+          echo "Seeded rsa-bootstrap-roster.json:"
+          ls -la /live-pvc/live-data/rsa-bootstrap-roster.json
+      volumeMounts:
+        - name: live-storage
+          mountPath: /live-pvc
 EOF
 }
 
@@ -2218,6 +2353,7 @@ deploy_block_node_for_cutover() {
       return 1
     fi
   fi
+  generate_rsa_bootstrap_roster_json
   write_block_node_cutover_values
   echo "BLOCK_NODE_EARLIEST_MANAGED_BLOCK=${BLOCK_NODE_CUTOVER_START_BLOCK} and BACKFILL_START_BLOCK=${BLOCK_NODE_CUTOVER_START_BLOCK} (BN joins mid-chain at this block)"
 
