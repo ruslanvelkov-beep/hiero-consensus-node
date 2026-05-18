@@ -21,8 +21,12 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 /**
- * Migration schema that increments the last block number and sets the first consensus time of the current block to the epoch timestamp.
- * This is necessary because the mechanism for which record files close is changing in release 0.75, and the the BlockInfo singleton
+ * Migration schema that initializes jumpstart wrapped-record voting metadata during an upgrade if the jumpstart data is present.
+ * It also makes the existing block record info and running hashes available as shared values for the upcoming
+ * jumpstart cutover (if applicable).
+ * <p>
+ * Also contains a migrate method that increments the last block number and sets the first consensus time of the current block to the epoch timestamp.
+ * This is necessary because the mechanism for which record files close is changing in release 0.75, and the BlockInfo singleton
  * needs to represent the last closed block number, which would be the freeze block number which would previously have been updated
  * when handling the next user transaction after an upgrade.
  */
@@ -98,6 +102,10 @@ public class V0750BlockRecordSchema extends Schema<SemanticVersion> {
         if (!ctx.isGenesis()) {
             final var blockInfoSingleton = ctx.newStates().<BlockInfo>getSingleton(BLOCKS_STATE_ID);
             final var existingBlockInfo = blockInfoSingleton.get();
+            if (existingBlockInfo == null) {
+                log.info("Skipping BlockInfo migration because BlockInfo singleton does not exist");
+                return;
+            }
             log.info("Migrating BlockInfo singleton with lastBlockNumber " + (existingBlockInfo.lastBlockNumber() + 1)
                     + " and firstConsTimeOfCurrentBlock to EPOCH");
             blockInfoSingleton.put(existingBlockInfo
