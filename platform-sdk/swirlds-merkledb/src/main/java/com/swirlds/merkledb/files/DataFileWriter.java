@@ -6,6 +6,7 @@ import static com.swirlds.merkledb.files.DataFileCommon.FIELD_DATAFILE_ITEMS;
 import static com.swirlds.merkledb.files.DataFileCommon.PAGE_SIZE;
 import static com.swirlds.merkledb.files.DataFileCommon.createDataFilePath;
 
+import com.hedera.pbj.runtime.ProtoConstants;
 import com.hedera.pbj.runtime.ProtoWriterTools;
 import com.hedera.pbj.runtime.io.WritableSequentialData;
 import com.hedera.pbj.runtime.io.buffer.BufferedData;
@@ -324,6 +325,7 @@ public final class DataFileWriter {
         final WritingWindow writingWindow = getWritingWindow(writingWindowIndex);
 
         try {
+            /*
             final MemoryData out = getTempLocalWriteBuffer(sizeToWrite);
             writer.accept(out);
             // double check that we wrote the expected number of bytes
@@ -336,6 +338,23 @@ public final class DataFileWriter {
             final MemorySegment segment = SEGMENT_CACHE.get();
             final long writingOffset = fileOffset % dataBufferSize;
             MemorySegment.copy(segment, 0, writingWindow.writeBuffer, writingOffset, sizeToWrite);
+            */
+            /*
+            final long writingOffset = fileOffset % dataBufferSize;
+            final MemoryData out = MemoryData.wrap(writingWindow.writeBuffer).slice(writingOffset, sizeToWrite);
+            writer.accept(out);
+            */
+
+            final long writingOffset = fileOffset % dataBufferSize;
+            final MemoryData out = MemoryData.wrap(writingWindow.writeBuffer);
+            out.position(writingOffset);
+            out.limit(writingOffset + sizeToWrite);
+            writer.accept(out);
+            if (out.remaining() != 0) {
+                throw new IOException("Estimated size / written bytes mismatch: expected=" + sizeToWrite + " written="
+                        + (sizeToWrite - out.remaining()));
+            }
+
         } finally {
             bytesWritten(fileOffset, sizeToWrite);
         }
