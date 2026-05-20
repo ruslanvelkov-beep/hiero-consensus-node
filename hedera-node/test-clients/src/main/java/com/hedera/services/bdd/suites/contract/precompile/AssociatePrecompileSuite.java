@@ -453,4 +453,25 @@ public class AssociatePrecompileSuite {
                 childRecordsCheck(
                         nullToken, CONTRACT_REVERT_EXECUTED, recordWith().status(INVALID_TOKEN_ID)));
     }
+
+    //TODO Glib:
+    @HapiTest
+    final Stream<DynamicTest> associateTokensLimit() {
+        final AtomicReference<Address> tokenAddress = new AtomicReference<>();
+        final AtomicReference<Address> accountAddress = new AtomicReference<>();
+        return hapiTest(
+                uploadInitCode(INNER_CONTRACT),
+                contractCreate(INNER_CONTRACT),
+                cryptoCreate(TOKEN_TREASURY),
+                tokenCreate(TOKEN)
+                        .tokenType(TokenType.FUNGIBLE_COMMON)
+                        .initialSupply(50L)
+                        .supplyKey(TOKEN_TREASURY)
+                        .adminKey(TOKEN_TREASURY)
+                        .treasury(TOKEN_TREASURY)
+                        .exposingAddressTo(tokenAddress::set),
+                cryptoCreate(ACCOUNT).exposingCreatedIdTo(id -> accountAddress.set(idAsHeadlongAddress(id)))
+
+                )
+    }
 }
