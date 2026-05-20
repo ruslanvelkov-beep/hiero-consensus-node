@@ -147,6 +147,23 @@ SOLO_076_UPGRADE_TIMEOUT_SECS="${SOLO_076_UPGRADE_TIMEOUT_SECS:-900}"
 MIRROR_RESTJAVA_MEMORY_REQUEST="${MIRROR_RESTJAVA_MEMORY_REQUEST:-512Mi}"
 MIRROR_RESTJAVA_MEMORY_LIMIT="${MIRROR_RESTJAVA_MEMORY_LIMIT:-1000Mi}"
 
+# WRAPS proving-key config (Step 10).
+# WRAPS_KEY_PATH holds the extracted artifacts pre-staged into each CN pod via Solo's
+# --wraps-key-path. WRAPS_TARBALL_CACHE_PATH is the cached tarball used to seed the
+# extracted directory. CNs additionally download the same tarball at runtime from
+# WRAPS_ARTIFACTS_DOWNLOAD_URL (mirrored into 0.76/application.properties as
+# tss.wrapsProvingKeyDownloadUrl).
+WRAPS_KEY_PATH="${WRAPS_KEY_PATH:-${HOME}/.solo/cache/wraps-v1.0.0}"
+WRAPS_TARBALL_CACHE_PATH="${WRAPS_TARBALL_CACHE_PATH:-${HOME}/.solo/cache/wraps-v1.0.0.tar.gz}"
+WRAPS_ARTIFACTS_DOWNLOAD_URL="${WRAPS_ARTIFACTS_DOWNLOAD_URL:-https://builds.hedera.com/tss/hiero/wraps/v1.0/wraps-v1.0.0.tar.gz}"
+WRAPS_REQUIRED_FILE_COUNT="${WRAPS_REQUIRED_FILE_COUNT:-4}"
+HAPI_PATH="${HAPI_PATH:-/opt/hgcapp/services-hedera/HapiApp2.0}"
+WRAPS_ARTIFACTS_CONTAINER_DIR_DEFAULT="${HAPI_PATH}/keys/wraps"
+# Local Docker nginx serving the wraps tarball at host.docker.internal:8089 so
+# CNs can pull it from inside the kind cluster without an internet round-trip.
+WRAPS_SERVER_PORT="${WRAPS_SERVER_PORT:-8089}"
+WRAPS_SERVER_CONTAINER_NAME="${WRAPS_SERVER_CONTAINER_NAME:-wraps-proving-key-server}"
+
 # SHA-384 hashes are 48 bytes => 96 hex chars.
 SHA384_ZERO_HEX="$(printf '0%.0s' {1..96})"
 SHA384_ONE_HEX="$(printf '1%.0s' {1..96})"
@@ -290,12 +307,109 @@ ACTIVE_INGRESS_REMOTE_PORT="80"
 
 log() { :; }
 
+# STEP_START_TS is set by print_banner and consumed by print_step_complete to
+# emit a wall-clock summary for the whole step block. Unset between steps so a
+# skipped step (via START_STEP) doesn't leak a stale start time into the next.
+STEP_START_TS=""
+
 print_banner() {
   local msg="$1"
+  STEP_START_TS=$SECONDS
   echo
   echo "======================================================================"
   echo "== ${msg}"
   echo "======================================================================"
+}
+
+print_step_complete() {
+  if [[ -z "${STEP_START_TS}" ]]; then
+    return 0
+  fi
+  local elapsed=$((SECONDS - STEP_START_TS))
+  local label="${1:-Step}"
+  echo "${label} complete (${elapsed}s)"
+  STEP_START_TS=""
+}
+
+# Quiet wrapper for long-running subprocesses (solo / kind / gradle).
+# Usage: run_with_spinner "Human-readable label" cmd arg1 arg2 ...
+#
+# Behavior:
+# - Echoes "▶ <label>" on its own line, then runs the command with stdout +
+#   stderr captured to ${WORK_DIR}/cmdlogs/<seq>-<slug>.log (the first line of
+#   the log is the literal command for debugging).
+# - In a TTY, animates a braille spinner with elapsed-second counter on the
+#   same line, refreshed every 200 ms. In a non-TTY (CI, piped output), prints
+#   a "." every 15 s so users know it's not hung.
+# - On success: replaces the spinner with "✓ <label> (Ns)" and returns 0.
+# - On failure: replaces the spinner with "✗ <label> (rc=N, Ns) — see <log>",
+#   dumps the last 200 lines of the captured log to stderr, then returns the
+#   command's exit code so `set -e` aborts naturally.
+RUN_WITH_SPINNER_SEQ=0
+RUN_WITH_SPINNER_FRAMES=('⠇' '⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇')
+
+run_with_spinner() {
+  local label="$1"; shift
+  local log_dir="${WORK_DIR}/cmdlogs"
+  mkdir -p "${log_dir}"
+  RUN_WITH_SPINNER_SEQ=$((RUN_WITH_SPINNER_SEQ + 1))
+  local slug
+  slug="$(printf '%s' "${label}" | tr ' /:' '___' | tr -c '[:alnum:]_-' '_' | cut -c1-60)"
+  local log_file
+  log_file="$(printf '%s/%03d-%s.log' "${log_dir}" "${RUN_WITH_SPINNER_SEQ}" "${slug}")"
+
+  echo "▶ ${label}"
+  echo "  $ $*"
+  {
+    echo "# label: ${label}"
+    echo "# cmd:   $*"
+    echo "# start: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "----"
+  } > "${log_file}"
+
+  local start_ts=$SECONDS
+  "$@" >> "${log_file}" 2>&1 &
+  local cmd_pid=$!
+
+  if [[ -t 1 ]]; then
+    local frame_count=${#RUN_WITH_SPINNER_FRAMES[@]}
+    local i=0
+    while kill -0 "${cmd_pid}" 2>/dev/null; do
+      printf '\r  %s working... (%ds)' "${RUN_WITH_SPINNER_FRAMES[i]}" "$((SECONDS - start_ts))"
+      i=$(( (i + 1) % frame_count ))
+      sleep 0.2
+    done
+  else
+    while kill -0 "${cmd_pid}" 2>/dev/null; do
+      sleep 15
+      kill -0 "${cmd_pid}" 2>/dev/null && printf '.'
+    done
+    printf '\n'
+  fi
+
+  wait "${cmd_pid}"
+  local rc=$?
+  local elapsed=$((SECONDS - start_ts))
+
+  if (( rc == 0 )); then
+    if [[ -t 1 ]]; then
+      printf '\r  \033[32m✓\033[0m %s (%ds)\033[K\n' "${label}" "${elapsed}"
+    else
+      printf '  ✓ %s (%ds)\n' "${label}" "${elapsed}"
+    fi
+  else
+    if [[ -t 1 ]]; then
+      printf '\r  \033[31m✗\033[0m %s (rc=%d, %ds) — last 200 lines below; full log at %s\033[K\n' \
+        "${label}" "${rc}" "${elapsed}" "${log_file}" >&2
+    else
+      printf '  ✗ %s (rc=%d, %ds) — last 200 lines below; full log at %s\n' \
+        "${label}" "${rc}" "${elapsed}" "${log_file}" >&2
+    fi
+    tail -n 200 "${log_file}" >&2
+    echo "--- end captured output (full log: ${log_file}) ---" >&2
+  fi
+
+  return ${rc}
 }
 
 cleanup() {
@@ -315,6 +429,7 @@ cleanup() {
   [[ -n "${GRAFANA_PORT_FORWARD_PID}" ]] && kill "${GRAFANA_PORT_FORWARD_PID}" >/dev/null 2>&1 || true
   [[ -n "${EXPLORER_INGRESS_PORT_FORWARD_PID}" ]] && kill "${EXPLORER_INGRESS_PORT_FORWARD_PID}" >/dev/null 2>&1 || true
   [[ -n "${PORT_FORWARD_WATCHDOG_PID}" ]] && kill "${PORT_FORWARD_WATCHDOG_PID}" >/dev/null 2>&1 || true
+  stop_wraps_proving_key_server
 
   if command -v solo >/dev/null 2>&1; then
     solo explorer node destroy --deployment "${SOLO_DEPLOYMENT}" >/dev/null 2>&1 || true
@@ -409,7 +524,7 @@ EOF
 validate_block_node_repo() {
   if [[ ! -d "${BLOCK_NODE_REPO_PATH}" ]]; then
     echo "BLOCK_NODE_REPO_PATH not found: ${BLOCK_NODE_REPO_PATH}" >&2
-    echo "Set BLOCK_NODE_REPO_PATH to your hiero-block-node checkout (branch driley/local-wrapped-record-files)." >&2
+    echo "Set BLOCK_NODE_REPO_PATH to your hiero-block-node checkout" >&2
     return 1
   fi
   if [[ ! -x "${BLOCK_NODE_REPO_PATH}/gradlew" ]]; then
@@ -422,14 +537,20 @@ wait_for_http_ok() {
   local url="$1"
   local max_attempts="$2"
   local sleep_secs="$3"
-  local attempt=1
-  while (( attempt <= max_attempts )); do
-    curl -sf "${url}" >/dev/null 2>&1 && return 0
-    sleep "${sleep_secs}"
-    ((attempt++))
-  done
-  echo "Timed out waiting for HTTP endpoint: ${url}" >&2
-  return 1
+  local label="${4:-Waiting for HTTP endpoint ${url}}"
+  # Quick probes (max_attempts <= 3) stay silent — they're used as "is this
+  # service ready yet" checks that callers branch on and don't need decoration.
+  if (( max_attempts <= 3 )); then
+    local attempt=1
+    while (( attempt <= max_attempts )); do
+      curl -sf "${url}" >/dev/null 2>&1 && return 0
+      sleep "${sleep_secs}"
+      ((attempt++))
+    done
+    return 1
+  fi
+  _spinner_wait "${label}" "${max_attempts}" "${sleep_secs}" \
+    curl -sf -o /dev/null "${url}"
 }
 
 wait_for_tcp_open() {
@@ -437,17 +558,82 @@ wait_for_tcp_open() {
   local port="$2"
   local max_attempts="$3"
   local sleep_secs="$4"
-  local attempt=1
-  while (( attempt <= max_attempts )); do
-    if command -v nc >/dev/null 2>&1; then
-      nc -z "${host}" "${port}" >/dev/null 2>&1 && return 0
-    else
-      (: <"/dev/tcp/${host}/${port}") >/dev/null 2>&1 && return 0
+  local label="${5:-Waiting for TCP endpoint ${host}:${port}}"
+  # Quick probes stay silent — see wait_for_http_ok.
+  if (( max_attempts <= 3 )); then
+    local attempt=1
+    while (( attempt <= max_attempts )); do
+      if command -v nc >/dev/null 2>&1; then
+        nc -z "${host}" "${port}" >/dev/null 2>&1 && return 0
+      else
+        (: <"/dev/tcp/${host}/${port}") >/dev/null 2>&1 && return 0
+      fi
+      sleep "${sleep_secs}"
+      ((attempt++))
+    done
+    return 1
+  fi
+  if command -v nc >/dev/null 2>&1; then
+    _spinner_wait "${label}" "${max_attempts}" "${sleep_secs}" \
+      nc -z "${host}" "${port}"
+  else
+    _spinner_wait "${label}" "${max_attempts}" "${sleep_secs}" \
+      bash -c "(: <\"/dev/tcp/${host}/${port}\") >/dev/null 2>&1"
+  fi
+}
+
+# Internal helper shared by wait_for_http_ok / wait_for_tcp_open for long polls.
+# Runs the predicate command every sleep_secs (up to max_attempts), animating
+# a braille spinner with elapsed seconds + attempt counter on TTY. Emits the
+# same ▶/✓/✗ idiom as run_with_spinner so the transcript reads consistently.
+_spinner_wait() {
+  local label="$1"
+  local max_attempts="$2"
+  local sleep_secs="$3"
+  shift 3
+  local total_deadline=$((SECONDS + max_attempts * sleep_secs))
+  local start_ts=$SECONDS
+  local next_check=$SECONDS
+  local frame_count=${#RUN_WITH_SPINNER_FRAMES[@]}
+  local i=0
+  local attempt=0
+  local is_tty=0
+  [[ -t 1 ]] && is_tty=1
+
+  echo "▶ ${label}"
+
+  while (( SECONDS < total_deadline )); do
+    if (( SECONDS >= next_check )); then
+      ((attempt++))
+      if "$@" >/dev/null 2>&1; then
+        local elapsed=$((SECONDS - start_ts))
+        if (( is_tty )); then
+          printf '\r  \033[32m✓\033[0m %s (%ds, %d attempts)\033[K\n' "${label}" "${elapsed}" "${attempt}"
+        else
+          printf '  ✓ %s (%ds, %d attempts)\n' "${label}" "${elapsed}" "${attempt}"
+        fi
+        return 0
+      fi
+      next_check=$((SECONDS + sleep_secs))
     fi
-    sleep "${sleep_secs}"
-    ((attempt++))
+    if (( is_tty )); then
+      printf '\r  %s polling... (%ds elapsed, attempt %d/%d)\033[K' \
+        "${RUN_WITH_SPINNER_FRAMES[i]}" "$((SECONDS - start_ts))" "${attempt}" "${max_attempts}"
+      i=$(( (i + 1) % frame_count ))
+      sleep 0.2
+    else
+      sleep "${sleep_secs}"
+    fi
   done
-  echo "Timed out waiting for TCP endpoint: ${host}:${port}" >&2
+
+  local elapsed=$((SECONDS - start_ts))
+  if (( is_tty )); then
+    printf '\r  \033[31m✗\033[0m %s — Timed out (%ds, %d attempts)\033[K\n' \
+      "${label}" "${elapsed}" "${attempt}" >&2
+  else
+    printf '  ✗ %s — Timed out (%ds, %d attempts)\n' \
+      "${label}" "${elapsed}" "${attempt}" >&2
+  fi
   return 1
 }
 
@@ -556,6 +742,9 @@ wait_for_haproxy_ready() {
 # leaves the old tunnel broken even though localhost still listens. Port numbers (50211 in-cluster)
 # do not change — the forward must be recreated.
 restart_post_upgrade_port_forwards() {
+  local cn_log="${WORK_DIR}/port-forward-cn.log"
+  local mirror_log="${WORK_DIR}/port-forward-mirror.log"
+
   if [[ -n "${CN_PORT_FORWARD_PID}" ]]; then
     kill "${CN_PORT_FORWARD_PID}" >/dev/null 2>&1 || true
     CN_PORT_FORWARD_PID=""
@@ -568,21 +757,77 @@ restart_post_upgrade_port_forwards() {
   kill_processes_on_local_port "${CN_GRPC_LOCAL_PORT}"
   kill_processes_on_local_port "${MIRROR_REST_LOCAL_PORT}"
   sleep 1
-  nohup kubectl -n "${SOLO_NAMESPACE}" port-forward svc/haproxy-node1-svc "${CN_GRPC_LOCAL_PORT}:non-tls-grpc-client-port" >/dev/null 2>&1 < /dev/null &
+
+  # Confirm the haproxy service has endpoints before starting the port-forward.
+  # Solo's freeze-restart can leave svc/haproxy-node1-svc temporarily without
+  # endpoints if the haproxy pod is still rolling — kubectl port-forward picks
+  # up no target and never binds the local port, then wait_for_tcp_open below
+  # times out with no visible reason. Wait up to 60s for an endpoint IP.
+  #
+  # Distinguish three failure modes:
+  #   1. kubectl unreachable (Docker daemon died / kind cluster gone) — surface
+  #      kubectl's actual stderr so the operator knows it's an environment issue.
+  #   2. Endpoint present but empty (selector mismatch, pod still terminating).
+  #   3. Endpoint populated — proceed.
+  local svc_endpoint_deadline=$((SECONDS + 60))
+  local svc_endpoint=""
+  local kubectl_stderr="${WORK_DIR}/restart-port-forward-kubectl.err"
+  : > "${kubectl_stderr}"
+  while (( SECONDS < svc_endpoint_deadline )); do
+    svc_endpoint="$(kubectl -n "${SOLO_NAMESPACE}" get endpoints haproxy-node1-svc \
+      -o jsonpath='{.subsets[0].addresses[0].ip}' 2>"${kubectl_stderr}")" || true
+    [[ -n "${svc_endpoint}" ]] && break
+    sleep 2
+  done
+  if [[ -z "${svc_endpoint}" ]]; then
+    local kubectl_err_tail
+    kubectl_err_tail="$(tail -n 3 "${kubectl_stderr}" 2>/dev/null)"
+    if [[ -n "${kubectl_err_tail}" ]]; then
+      echo "kubectl could not reach the apiserver while polling svc/haproxy-node1-svc endpoints:" >&2
+      printf '%s\n' "${kubectl_err_tail}" | sed 's/^/    /' >&2
+      echo "  This is almost always Docker Desktop crashing under load — check 'docker info' and Docker Desktop's resource limits." >&2
+    else
+      echo "svc/haproxy-node1-svc has no endpoints after 60s (kubectl reachable but endpoint set empty); cannot port-forward to ${CN_GRPC_LOCAL_PORT}" >&2
+      echo "  Snapshot of svc + endpoints + matching pods:" >&2
+      kubectl -n "${SOLO_NAMESPACE}" get svc haproxy-node1-svc -o yaml >&2 2>/dev/null || true
+      kubectl -n "${SOLO_NAMESPACE}" get endpoints haproxy-node1-svc -o yaml >&2 2>/dev/null || true
+      kubectl -n "${SOLO_NAMESPACE}" get pods -l app=haproxy-node1 -o wide --show-labels >&2 2>/dev/null || true
+    fi
+    return 1
+  fi
+  echo "  svc/haproxy-node1-svc endpoint ${svc_endpoint} ready; opening port-forward to localhost:${CN_GRPC_LOCAL_PORT} (kubectl log: ${cn_log})"
+  : > "${cn_log}"
+  nohup kubectl -n "${SOLO_NAMESPACE}" port-forward svc/haproxy-node1-svc "${CN_GRPC_LOCAL_PORT}:non-tls-grpc-client-port" >"${cn_log}" 2>&1 < /dev/null &
   CN_PORT_FORWARD_PID="$!"
   disown "${CN_PORT_FORWARD_PID}" 2>/dev/null || true
+
   if mirror_rest_service_exists; then
-    nohup kubectl -n "${SOLO_NAMESPACE}" port-forward "svc/${MIRROR_REST_SERVICE}" "${MIRROR_REST_LOCAL_PORT}:http" >/dev/null 2>&1 < /dev/null &
+    echo "  svc/${MIRROR_REST_SERVICE} present; opening port-forward to localhost:${MIRROR_REST_LOCAL_PORT} (kubectl log: ${mirror_log})"
+    : > "${mirror_log}"
+    nohup kubectl -n "${SOLO_NAMESPACE}" port-forward "svc/${MIRROR_REST_SERVICE}" "${MIRROR_REST_LOCAL_PORT}:http" >"${mirror_log}" 2>&1 < /dev/null &
     MIRROR_PORT_FORWARD_PID="$!"
     disown "${MIRROR_PORT_FORWARD_PID}" 2>/dev/null || true
   fi
   sleep 2
+
   if ! wait_for_tcp_open "127.0.0.1" "${CN_GRPC_LOCAL_PORT}" 20 1; then
     echo "Consensus gRPC port-forward did not become reachable on localhost:${CN_GRPC_LOCAL_PORT}" >&2
+    if kill -0 "${CN_PORT_FORWARD_PID}" 2>/dev/null; then
+      echo "  kubectl process is still alive (PID ${CN_PORT_FORWARD_PID}); last 20 log lines:" >&2
+    else
+      echo "  kubectl process died (PID ${CN_PORT_FORWARD_PID}); last 20 log lines:" >&2
+    fi
+    tail -n 20 "${cn_log}" >&2 2>/dev/null || true
     return 1
   fi
   if [[ -n "${MIRROR_PORT_FORWARD_PID}" ]] && ! wait_for_tcp_open "127.0.0.1" "${MIRROR_REST_LOCAL_PORT}" 20 1; then
     echo "Mirror REST port-forward did not become reachable on localhost:${MIRROR_REST_LOCAL_PORT}" >&2
+    if kill -0 "${MIRROR_PORT_FORWARD_PID}" 2>/dev/null; then
+      echo "  kubectl process is still alive (PID ${MIRROR_PORT_FORWARD_PID}); last 20 log lines:" >&2
+    else
+      echo "  kubectl process died (PID ${MIRROR_PORT_FORWARD_PID}); last 20 log lines:" >&2
+    fi
+    tail -n 20 "${mirror_log}" >&2 2>/dev/null || true
     return 1
   fi
 }
@@ -928,14 +1173,16 @@ download_solo_minio_record_streams() {
 
 local_build_implementation_version() {
   unzip -p "${LOCAL_BUILD_PATH}/apps/HederaNode.jar" META-INF/MANIFEST.MF 2>/dev/null \
-    | sed -n 's/^Implementation-Version: //p' | head -n 1
+    | sed -n 's/^Implementation-Version: //p' | tr -d '\r' | head -n 1
 }
 
 consensus_pod_implementation_version() {
   local pod="$1"
+  # MANIFEST.MF uses CRLF line endings — strip the trailing \r so callers can safely
+  # embed the result in echo lines without it rewinding the cursor mid-print.
   kubectl -n "${SOLO_NAMESPACE}" exec "${pod}" -c root-container -- sh -lc \
     "unzip -p /opt/hgcapp/services-hedera/HapiApp2.0/data/apps/HederaNode.jar META-INF/MANIFEST.MF 2>/dev/null \
-      | sed -n 's/^Implementation-Version: //p' | head -n 1"
+      | sed -n 's/^Implementation-Version: //p' | tr -d '\r' | head -n 1"
 }
 
 verify_local_build_on_consensus_nodes() {
@@ -947,13 +1194,18 @@ verify_local_build_on_consensus_nodes() {
   local_version="$(local_build_implementation_version)"
   [[ -n "${local_version}" ]] || { echo "Unable to determine local build version for verification" >&2; return 1; }
 
+  echo "Verifying local-build version on each consensus node (expected ${local_version})"
   IFS=',' read -r -a nodes <<< "${NODE_ALIASES}"
 
   for node in "${nodes[@]}"; do
     pod="network-${node}-0"
     pod_version="$(consensus_pod_implementation_version "${pod}" || true)"
-    log "Verifying local build version on ${pod} (expected ${local_version}, found ${pod_version:-unknown})"
-    [[ "${pod_version}" == "${local_version}" ]]
+    if [[ "${pod_version}" == "${local_version}" ]]; then
+      echo "  ${pod}: ${pod_version} OK"
+    else
+      echo "  ${pod}: expected ${local_version}, found ${pod_version:-unknown}" >&2
+      return 1
+    fi
   done
 }
 
@@ -999,13 +1251,390 @@ run_075_upgrade() {
     --force
   )
 
-  run_command_with_timeout "${SOLO_075_UPGRADE_TIMEOUT_SECS}" "${upgrade_cmd[@]}"
+  run_with_spinner "Upgrading consensus network to ${UPGRADE_075_VERSION} (local build, jumpstart)" \
+    run_command_with_timeout "${SOLO_075_UPGRADE_TIMEOUT_SECS}" "${upgrade_cmd[@]}"
   wait_for_consensus_pods_ready 600
   wait_for_haproxy_ready 600
   verify_local_build_on_consensus_nodes
 }
 
+ensure_wraps_artifacts_downloaded() {
+  local file_count=""
+  local tmp_dir=""
+  local extract_dir=""
+  local extracted_root=""
+  local extracted_dirs=""
+  local extracted_entries=""
+
+  if [[ -d "${WRAPS_KEY_PATH}" ]]; then
+    file_count="$(find "${WRAPS_KEY_PATH}" -maxdepth 1 -type f | wc -l | tr -d ' ')"
+    if [[ "${file_count}" -ge "${WRAPS_REQUIRED_FILE_COUNT}" && -f "${WRAPS_TARBALL_CACHE_PATH}" ]]; then
+      log "Using cached WRAPS artifacts from ${WRAPS_KEY_PATH}"
+      return 0
+    fi
+  fi
+
+  mkdir -p "$(dirname "${WRAPS_TARBALL_CACHE_PATH}")"
+  if [[ ! -f "${WRAPS_TARBALL_CACHE_PATH}" ]]; then
+    log "Downloading WRAPS artifacts from ${WRAPS_ARTIFACTS_DOWNLOAD_URL}"
+    curl -fL "${WRAPS_ARTIFACTS_DOWNLOAD_URL}" -o "${WRAPS_TARBALL_CACHE_PATH}.partial"
+    mv "${WRAPS_TARBALL_CACHE_PATH}.partial" "${WRAPS_TARBALL_CACHE_PATH}"
+  fi
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/solo-wraps-extract.XXXXXX")"
+  extract_dir="${tmp_dir}/extract"
+  mkdir -p "${extract_dir}"
+  tar -xzf "${WRAPS_TARBALL_CACHE_PATH}" -C "${extract_dir}"
+
+  extracted_root="${extract_dir}"
+  extracted_dirs="$(find "${extract_dir}" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
+  extracted_entries="$(find "${extract_dir}" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')"
+  if [[ "${extracted_dirs}" == "1" && "${extracted_entries}" == "1" ]]; then
+    extracted_root="$(find "${extract_dir}" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+  fi
+
+  mkdir -p "$(dirname "${WRAPS_KEY_PATH}")"
+  rm -rf "${WRAPS_KEY_PATH}"
+  mkdir -p "${WRAPS_KEY_PATH}"
+  find "${extracted_root}" -maxdepth 1 -type f -exec cp '{}' "${WRAPS_KEY_PATH}/" ';'
+  rm -rf "${tmp_dir}"
+}
+
+configured_wraps_artifacts_container_dir() {
+  local configured=""
+
+  configured="$(sed -n 's/^TSS_LIB_WRAPS_ARTIFACTS_PATH=//p' "${APP_ENV_076_FILE}" | head -n 1)"
+  if [[ -n "${configured}" ]]; then
+    printf '%s\n' "${configured}"
+  else
+    printf '%s\n' "${WRAPS_ARTIFACTS_CONTAINER_DIR_DEFAULT}"
+  fi
+}
+
+consensus_pod_wraps_env() {
+  local pod="$1"
+
+  kubectl -n "${SOLO_NAMESPACE}" exec "${pod}" -c root-container -- sh -lc \
+    "pid=\$(pgrep -f 'com.hedera.node.app.ServicesMain' | head -n 1);
+     if [ -n \"\${pid}\" ] && [ -r \"/proc/\${pid}/environ\" ]; then
+       tr '\\000' '\\n' < \"/proc/\${pid}/environ\" | sed -n 's/^TSS_LIB_WRAPS_ARTIFACTS_PATH=//p' | head -n 1
+     fi" 2>/dev/null
+}
+
+consensus_pod_wraps_file_count() {
+  local pod="$1"
+  local wraps_dir="$2"
+
+  kubectl -n "${SOLO_NAMESPACE}" exec "${pod}" -c root-container -- sh -lc \
+    "find ${wraps_dir} -maxdepth 1 -type f 2>/dev/null | wc -l" 2>/dev/null | tr -d ' '
+}
+
+wraps_proof_present_in_log() {
+  local pod="$1"
+
+  kubectl -n "${SOLO_NAMESPACE}" exec "${pod}" -c root-container -- sh -lc \
+    "grep -Eq 'Constructing (genesis|incremental) WRAPS proof with:' ${HAPI_PATH}/output/hgcaa.log" >/dev/null 2>&1
+}
+
+wraps_failure_present_in_log() {
+  local pod="$1"
+
+  kubectl -n "${SOLO_NAMESPACE}" exec "${pod}" -c root-container -- sh -lc \
+    "grep -Eq 'WRAPS library is not ready|Skipping publication of POST_AGGREGATION output: WRAPS library is not ready' ${HAPI_PATH}/output/hgcaa.log" >/dev/null 2>&1
+}
+
+verify_wraps_on_consensus_nodes() {
+  local wraps_dir=""
+  local expected_wraps=""
+  local timeout_secs="${1:-300}"
+  local deadline=0
+  local node=""
+  local pod=""
+  local found_env=""
+  local found_wraps=""
+  local nodes=()
+
+  wraps_dir="$(configured_wraps_artifacts_container_dir)"
+  expected_wraps="$(find "${WRAPS_KEY_PATH}" -maxdepth 1 -type f | wc -l | tr -d ' ')"
+  [[ "${expected_wraps}" -ge "${WRAPS_REQUIRED_FILE_COUNT}" ]] || {
+    echo "Expected at least ${WRAPS_REQUIRED_FILE_COUNT} WRAPS artifacts in ${WRAPS_KEY_PATH}, found ${expected_wraps}" >&2
+    return 1
+  }
+
+  echo "Verifying WRAPS runtime on each consensus node (env=${wraps_dir}, expecting ${expected_wraps} extracted files, ${timeout_secs}s for proof construction)"
+  IFS=',' read -r -a nodes <<< "${NODE_ALIASES}"
+  for node in "${nodes[@]}"; do
+    pod="network-${node}-0"
+    found_env="$(consensus_pod_wraps_env "${pod}" || true)"
+    found_wraps="$(consensus_pod_wraps_file_count "${pod}" "${wraps_dir}" || true)"
+    if [[ "${found_env}" != "${wraps_dir}" ]]; then
+      echo "  ${pod}: TSS_LIB_WRAPS_ARTIFACTS_PATH env mismatch (expected ${wraps_dir}, found ${found_env:-unset})" >&2
+      return 1
+    fi
+    if [[ "${found_wraps}" != "${expected_wraps}" ]]; then
+      echo "  ${pod}: wraps artifact count mismatch (expected ${expected_wraps}, found ${found_wraps:-0})" >&2
+      return 1
+    fi
+    echo "  ${pod}: env + ${found_wraps} artifacts OK; waiting for 'Constructing (genesis|incremental) WRAPS proof with:' in hgcaa.log"
+    deadline=$((SECONDS + timeout_secs))
+    local progress_tick=0
+    while (( SECONDS < deadline )); do
+      if wraps_failure_present_in_log "${pod}"; then
+        echo "  ${pod}: WRAPS reported a runtime failure (check ${HAPI_PATH}/output/hgcaa.log)" >&2
+        return 1
+      fi
+      if wraps_proof_present_in_log "${pod}"; then
+        echo "  ${pod}: WRAPS proof construction detected"
+        break
+      fi
+      # Every ~30s (6 ticks of 5s) emit a heartbeat — proof construction can take a while.
+      if (( progress_tick > 0 && progress_tick % 6 == 0 )); then
+        echo "    ...still waiting on ${pod} ($((deadline - SECONDS))s remaining)"
+      fi
+      ((progress_tick++))
+      sleep 5
+    done
+
+    if ! wraps_proof_present_in_log "${pod}"; then
+      echo "  ${pod}: timed out after ${timeout_secs}s waiting for WRAPS proof construction" >&2
+      return 1
+    fi
+  done
+
+  echo "All consensus nodes confirmed: WRAPS env wired, artifacts present, proof construction observed"
+}
+
+# Wraps remedy strategy:
+# 1. Serve the wraps tarball locally via nginx on host.docker.internal:8089 so
+#    each CN downloads it from inside the kind cluster without a 1.86 GB pull
+#    from builds.hedera.com on every JVM start. See start-wraps-proving-key-server.sh
+#    for the standalone equivalent — we delegate to it for the docker run.
+# 2. Inject TSS_LIB_WRAPS_ARTIFACTS_PATH directly into each network-nodeX
+#    StatefulSet's container spec via `kubectl set env`. This is the only path
+#    we've confirmed actually reaches the JVM `/proc/$pid/environ`. Solo's
+#    --application-env drops the file at /etc/network-node/env/application.env
+#    but the container entrypoint never sources it. Setting via the spec also
+#    survives subsequent pod restarts (kubectl delete pod, freeze-upgrades,
+#    container crashes), which the ephemeral kubectl-cp + entrypoint patch
+#    approach did NOT survive.
+# 3. After Solo's upgrade returns (success OR timeout), recover any CN that
+#    failed to reach ACTIVE/CHECKING/OBSERVING. Jars + state live on the PVC,
+#    so a `kubectl delete pod` re-rolls the JVM from a settled disk and
+#    sidesteps the "jars still copying" startup race that intermittently kills
+#    one or two nodes per upgrade.
+
+ensure_wraps_proving_key_server() {
+  local server_url
+  server_url="http://127.0.0.1:${WRAPS_SERVER_PORT:-8089}/$(basename "${WRAPS_TARBALL_CACHE_PATH}")"
+
+  if curl -sfI "${server_url}" >/dev/null 2>&1; then
+    log "Wraps proving key server already serving ${server_url}"
+    return 0
+  fi
+
+  require_cmd docker
+  if [[ ! -f "${WRAPS_TARBALL_CACHE_PATH}" ]]; then
+    echo "Wraps tarball cache not found: ${WRAPS_TARBALL_CACHE_PATH}" >&2
+    echo "Run Step 10 from earlier, or fetch the tarball into the cache path first." >&2
+    return 1
+  fi
+
+  echo "Starting wraps proving key server (nginx Docker on port ${WRAPS_SERVER_PORT:-8089})"
+  WRAPS_TAR_PATH="${WRAPS_TARBALL_CACHE_PATH}" \
+  WRAPS_SERVER_PORT="${WRAPS_SERVER_PORT:-8089}" \
+    "${SCRIPT_DIR}/start-wraps-proving-key-server.sh"
+}
+
+stop_wraps_proving_key_server() {
+  local name="${WRAPS_SERVER_CONTAINER_NAME:-wraps-proving-key-server}"
+  if command -v docker >/dev/null 2>&1; then
+    docker rm -f "${name}" >/dev/null 2>&1 || true
+  fi
+}
+
+inject_wraps_env_into_statefulsets() {
+  local node sts log_file
+  local wraps_dir nodes=()
+  wraps_dir="$(configured_wraps_artifacts_container_dir)"
+  log_file="${WORK_DIR}/inject-wraps-env.log"
+  : > "${log_file}"
+
+  IFS=',' read -r -a nodes <<< "${NODE_ALIASES}"
+  echo "Injecting TSS_LIB_WRAPS_ARTIFACTS_PATH=${wraps_dir} into 4 consensus StatefulSets (log: ${log_file})"
+
+  # `kubectl set env` emits a wave of duplicate-port warnings on every call
+  # because Solo's pod template has `pprof`/`stats` named ports duplicated
+  # across containers — and `kubectl rollout status` chats incrementally. Both
+  # streams are noise the operator can read from the log file if needed; the
+  # script just emits one summary line per node.
+  for node in "${nodes[@]}"; do
+    sts="network-${node}"
+    {
+      echo "=== set env statefulset/${sts} ==="
+      kubectl -n "${SOLO_NAMESPACE}" set env "statefulset/${sts}" -c root-container \
+        "TSS_LIB_WRAPS_ARTIFACTS_PATH=${wraps_dir}" 2>&1
+    } >> "${log_file}"
+  done
+
+  for node in "${nodes[@]}"; do
+    sts="network-${node}"
+    printf '  injecting env into statefulset/%s... ' "${sts}"
+    if {
+        echo "=== rollout status statefulset/${sts} ==="
+        kubectl -n "${SOLO_NAMESPACE}" rollout status "statefulset/${sts}" --timeout=600s 2>&1
+      } >> "${log_file}"; then
+      echo "rolled out"
+    else
+      echo "FAILED (see ${log_file})"
+      return 1
+    fi
+  done
+}
+
+consensus_node_platform_state() {
+  local pod="$1"
+  kubectl -n "${SOLO_NAMESPACE}" exec "${pod}" -c root-container -- sh -lc \
+    "grep -oE 'HederaNode#[0-9]+ is [A-Z_]+' /opt/hgcapp/services-hedera/HapiApp2.0/output/hgcaa.log 2>/dev/null | tail -1 | awk '{print \$NF}'" 2>/dev/null
+}
+
+# Recovery for a JAR-staging race in `solo consensus network upgrade --local-build-path`:
+# Solo's `Fetch platform software` task `kubectl cp`s the local-build jars into
+# each CN's data/lib, then `Starting nodes` re-execs the JVM almost immediately.
+# Occasionally one or more JVMs start while the JAR files are still settling on
+# disk, and class loading fails with `NoClassDefFoundError: Could not initialize
+# class com.sun.jna.Native` (lazysodium → Ed25519VerificationProvider.<clinit>)
+# or `semantic-version.properties could not be found`. Those JVMs die during
+# startup but the pod itself stays Running (k8s readiness probes don't catch a
+# crashed JVM), so Solo's `Check all nodes are ACTIVE` task spins until its 300
+# attempts run out and Solo exits non-zero with `node 'nodeX' is not ACTIVE`.
+#
+# Related but DIFFERENT: Solo issue https://github.com/hiero-ledger/solo/issues/3923
+# (fixed in PR #4020, shipped in Solo 0.71.0) covers `cannot exec into a container
+# in a completed pod` when uploading wraps files to a pod in Failed phase. That
+# fix is already in the user's Solo 0.73.0 — it does NOT address the JVM-startup
+# vs. local-build-jar race this function works around. Do not delete this
+# function on the assumption "Solo's fixed it"; verify the second race is gone
+# (multiple clean Step 10 runs with no FREEZE_COMPLETE→STARTING transitions) first.
+#
+# Strategy: poll each CN's platform state from hgcaa.log; the only healthy
+# terminal state is ACTIVE. FREEZE_COMPLETE / STARTING / CHECKING / OBSERVING /
+# REPLAYING_EVENTS are transient — if a pod stays there past
+# RECOVER_STABLE_WAIT_SECS, kubectl-delete it. Jars + state live on the PVC, so
+# the new pod boots from a settled disk and the second boot wins.
+recover_stuck_consensus_nodes() {
+  # Optional first arg: "true" if Solo's upgrade just failed, so the first pass
+  # should skip the per-pass wait window — pods that didn't reach ACTIVE for
+  # Solo's own 300-attempt check aren't going to spontaneously transition.
+  # Go straight to identifying + re-rolling stuck pods.
+  local solo_failed="${1:-false}"
+  local max_passes="${RECOVER_MAX_PASSES:-3}"
+  local stable_wait_secs="${RECOVER_STABLE_WAIT_SECS:-180}"
+  local pass=1
+  local node pod state stuck
+  local nodes=()
+  IFS=',' read -r -a nodes <<< "${NODE_ALIASES}"
+
+  if [[ "${solo_failed}" == "true" ]]; then
+    echo "Solo upgrade already failed; skipping the per-pass wait on pass 1 and going straight to re-roll"
+  else
+    echo "Waiting up to ${stable_wait_secs}s for all CNs to reach ACTIVE (max ${max_passes} re-roll passes)"
+  fi
+
+  while (( pass <= max_passes )); do
+    # On pass 1 when solo_failed=true, deadline=SECONDS forces us to skip the
+    # inner wait loop and fall through to the stuck-pod identification block.
+    local deadline=$((SECONDS + stable_wait_secs))
+    if [[ "${solo_failed}" == "true" && ${pass} -eq 1 ]]; then
+      deadline=$SECONDS
+    fi
+    local progress_tick=0
+    while (( SECONDS < deadline )); do
+      local all_active=true
+      local report=()
+      for node in "${nodes[@]}"; do
+        pod="network-${node}-0"
+        state="$(consensus_node_platform_state "${pod}" || true)"
+        report+=("${node}=${state:-unknown}")
+        if [[ "${state}" != "ACTIVE" ]]; then
+          all_active=false
+        fi
+      done
+      if ${all_active}; then
+        echo "All consensus nodes reached ACTIVE on pass ${pass}: ${report[*]}"
+        return 0
+      fi
+      # Every ~30s (3 ticks of 10s), echo a heartbeat so the user can see we
+      # are still alive and waiting, without spamming on every poll.
+      if (( progress_tick % 3 == 0 )); then
+        echo "  ...still waiting (pass ${pass}/${max_passes}, $((SECONDS < deadline ? deadline - SECONDS : 0))s remaining); states: ${report[*]}"
+      fi
+      ((progress_tick++))
+      sleep 10
+    done
+
+    stuck=()
+    local final_report=()
+    for node in "${nodes[@]}"; do
+      pod="network-${node}-0"
+      state="$(consensus_node_platform_state "${pod}" || true)"
+      final_report+=("${node}=${state:-unknown}")
+      if [[ "${state}" != "ACTIVE" ]]; then
+        stuck+=("${pod}")
+      fi
+    done
+
+    if (( ${#stuck[@]} == 0 )); then
+      echo "All consensus nodes reached ACTIVE on pass ${pass}: ${final_report[*]}"
+      return 0
+    fi
+
+    echo "Pass ${pass}/${max_passes}: re-rolling stuck pod(s) [${stuck[*]}]; states=${final_report[*]}"
+    for pod in "${stuck[@]}"; do
+      kubectl -n "${SOLO_NAMESPACE}" delete pod "${pod}" >/dev/null 2>&1 || true
+    done
+
+    echo "  Waiting for re-rolled pods + haproxy to be ready..."
+    wait_for_consensus_pods_ready 600
+    wait_for_haproxy_ready 600
+    sleep 30
+    ((pass++))
+  done
+
+  echo "Some consensus nodes did not reach ACTIVE after ${max_passes} passes" >&2
+  for node in "${nodes[@]}"; do
+    pod="network-${node}-0"
+    state="$(consensus_node_platform_state "${pod}" || true)"
+    echo "  ${pod}: ${state:-unknown}" >&2
+  done
+  return 1
+}
+
+apply_wraps_remedy_to_consensus_nodes() {
+  inject_wraps_env_into_statefulsets
+  recover_stuck_consensus_nodes
+}
+
 run_076_upgrade() {
+  # Local nginx server providing the wraps tarball at host.docker.internal:8089.
+  # The CN's tss.wrapsProvingKeyDownloadEnabled flow will pull from this URL.
+  ensure_wraps_proving_key_server
+
+  # Inject TSS_LIB_WRAPS_ARTIFACTS_PATH into each StatefulSet's container spec
+  # BEFORE Solo's upgrade fires. The rolling restart triggered here runs against
+  # the 0.75 binary, which doesn't use the env var, so it's harmless. Solo's
+  # subsequent freeze-restart is coordinated across all 4 nodes (they all stop
+  # at the same consensus round and resume at the same round) and the env we
+  # pre-injected is preserved through helm's strategic-merge upgrade, so the
+  # 0.76 JVMs all initialize WRAPS in lockstep.
+  #
+  # If we instead inject AFTER Solo's upgrade, kubectl set env triggers a
+  # rolling restart on each StatefulSet independently — one pod finishes WRAPS
+  # init and publishes a proof key while others are still on the old config,
+  # which causes a SELF_ISS catastrophic failure on every node.
+  inject_wraps_env_into_statefulsets
+
+  # Note: --wraps-key-path intentionally omitted. Solo only honors it on
+  # `consensus network deploy`; on upgrade it's silently dropped.
   local upgrade_cmd=(
     solo consensus network upgrade
     --deployment "${SOLO_DEPLOYMENT}"
@@ -1018,10 +1647,55 @@ run_076_upgrade() {
     --force
   )
 
-  run_command_with_timeout "${SOLO_076_UPGRADE_TIMEOUT_SECS}" "${upgrade_cmd[@]}"
-  wait_for_consensus_pods_ready 600
-  wait_for_haproxy_ready 600
+  local solo_rc=0
+  set +e
+  run_with_spinner "Upgrading consensus network to ${UPGRADE_076_VERSION} (local build, 0.76 properties)" \
+    run_command_with_timeout "${SOLO_076_UPGRADE_TIMEOUT_SECS}" "${upgrade_cmd[@]}"
+  solo_rc=$?
+  set -e
+
+  echo "--- Step 10 check 1/5: recover any stuck consensus nodes ---"
+  if (( solo_rc != 0 )); then
+    echo "Solo upgrade returned non-zero (rc=${solo_rc}); skipping pre-wait and going straight to pod re-roll"
+    recover_stuck_consensus_nodes true
+  else
+    echo "Solo upgrade returned success; verifying nodes reached ACTIVE"
+    recover_stuck_consensus_nodes false
+  fi
+
+  echo "--- Step 10 check 2/5: verify local-build version on every consensus node ---"
   verify_local_build_on_consensus_nodes
+
+  # Solo's `consensus network upgrade` rolls the haproxy deployments via its
+  # chart upgrade but does NOT wait for them to finish rolling — so when Solo
+  # returns, the haproxy pods may still be Terminating/Pending and
+  # svc/haproxy-node1-svc has no endpoints. recover_stuck_consensus_nodes only
+  # waits for haproxy after re-rolling a stuck CN pod; on the happy path
+  # (all 4 ACTIVE on pass 1, no re-roll) it never fires, and the next step
+  # (restart_post_upgrade_port_forwards → kubectl port-forward svc/haproxy-node1-svc)
+  # hits an empty endpoint set and the local port never binds. Wait explicitly.
+  echo "  Waiting for haproxy deployments to finish rolling out (Solo's chart upgrade is async)"
+  wait_for_haproxy_ready 600
+
+  # The TSS ceremony (proof key publication → CRS contribution → adoption →
+  # proof construction) stalls without new rounds, and rounds don't advance
+  # without transactions. Re-establish the CN/mirror port-forwards and submit
+  # a cryptoCreate to drive consensus forward; otherwise verify_wraps will
+  # time out waiting for "Constructing genesis WRAPS proof with:" on a totally
+  # idle network.
+  echo "--- Step 10 check 3/5: re-establish CN gRPC + Mirror REST port-forwards ---"
+  restart_post_upgrade_port_forwards
+  echo "  Waiting for Mirror REST to serve /api/v1/blocks on http://127.0.0.1:${MIRROR_REST_LOCAL_PORT} (up to 3m)"
+  wait_for_http_ok "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/blocks?limit=1" 36 5
+  echo "  Mirror REST responding"
+
+  echo "--- Step 10 check 4/5: submit cryptoCreate to nudge consensus + confirm mirror sees the new account ---"
+  export MIRROR_ACCOUNT_WAIT_MS="${MIRROR_ACCOUNT_WAIT_MS:-180000}"
+  node "${NODE_SCRIPT}"
+
+  echo "--- Step 10 check 5/5: verify WRAPS runtime + proof construction on every consensus node ---"
+  verify_wraps_on_consensus_nodes 300
+  echo "--- Step 10 all checks passed ---"
 }
 
 create_temp_075_upgrade_properties() {
@@ -1863,9 +2537,8 @@ prepare_wrap_day_archives_from_record_streams() {
     return 1
   fi
 
-  if ! (
-    cd "${BLOCK_NODE_REPO_PATH}" && ./gradlew :tools:run --args="days compress -o ${WRAP_COMPRESSED_DAYS_DIR} ${WRAP_DAYS_SRC_DIR}"
-  ) >/dev/null 2>&1; then
+  if ! run_with_spinner "Building wrap input archives (gradle :tools:run days compress)" \
+      bash -c "cd '${BLOCK_NODE_REPO_PATH}' && ./gradlew :tools:run --args='days compress -o ${WRAP_COMPRESSED_DAYS_DIR} ${WRAP_DAYS_SRC_DIR}'"; then
     echo "Failed to build .tar.zstd wrap input archives" >&2
     return 1
   fi
@@ -1905,9 +2578,8 @@ run_block_node_wrap_tool() {
     wrap_args="${wrap_args} ${BLOCKS_WRAP_EXTRA_ARGS}"
   fi
 
-  if ! (
-    cd "${BLOCK_NODE_REPO_PATH}" && ./gradlew :tools:run --args="${wrap_args}"
-  ) >/dev/null 2>&1; then
+  if ! run_with_spinner "Running block-node wrap tool (gradle :tools:run blocks wrap)" \
+      bash -c "cd '${BLOCK_NODE_REPO_PATH}' && ./gradlew :tools:run --args='${wrap_args}'"; then
     echo "Block Node wrap command failed" >&2
     return 1
   fi
@@ -2131,7 +2803,8 @@ EOF
 deploy_mirror_node_for_cutover() {
   local ec=0
   write_mirror_node_values_override
-  if solo mirror node add \
+  if run_with_spinner "Deploying mirror node" \
+    solo mirror node add \
     --deployment "${SOLO_DEPLOYMENT}" \
     --enable-ingress \
     --values-file "${MIRROR_NODE_VALUES_FILE}"; then
@@ -2365,7 +3038,8 @@ deploy_block_node_for_cutover() {
   add_args+=(--values-file "${values_files}")
 
   echo "Deploying Block Node ${BLOCK_NODE_ID} and routing consensus nodes with priority mapping '${BLOCK_NODE_PRIORITY_MAPPING}'"
-  "${add_args[@]}"
+  run_with_spinner "Deploying Block Node ${BLOCK_NODE_ID}" \
+    "${add_args[@]}"
   kubectl -n "${SOLO_NAMESPACE}" wait --for=condition=ready "pod/block-node-${BLOCK_NODE_ID}-0" --timeout="${BLOCK_NODE_READY_TIMEOUT_SECS}s"
 }
 
@@ -2475,36 +3149,49 @@ if should_run_step 1; then
   cleanup_record_stream_files_only
   rm -rf "${WRAPPED_BLOCKS_DIR}" >/dev/null 2>&1 || true
 
-  kind create cluster -n "${SOLO_CLUSTER_NAME}"
+  run_with_spinner "Creating kind cluster ${SOLO_CLUSTER_NAME}" \
+    kind create cluster -n "${SOLO_CLUSTER_NAME}"
 
-  solo cluster-ref config connect --cluster-ref kind-${SOLO_CLUSTER_NAME} --context kind-${SOLO_CLUSTER_NAME}
+  run_with_spinner "Connecting Solo to kind cluster" \
+    solo cluster-ref config connect --cluster-ref kind-${SOLO_CLUSTER_NAME} --context kind-${SOLO_CLUSTER_NAME}
   solo deployment config delete --deployment "${SOLO_DEPLOYMENT}" --quiet-mode >/dev/null 2>&1 || true
-  solo deployment config create -n "${SOLO_NAMESPACE}" --deployment "${SOLO_DEPLOYMENT}"
-  solo deployment cluster attach --deployment "${SOLO_DEPLOYMENT}" --cluster-ref kind-${SOLO_CLUSTER_NAME} --num-consensus-nodes "${CONSENSUS_NODE_COUNT}"
-  solo cluster-ref config setup -s "${SOLO_CLUSTER_SETUP_NAMESPACE}" --prometheus-stack true
+  run_with_spinner "Creating Solo deployment ${SOLO_DEPLOYMENT}" \
+    solo deployment config create -n "${SOLO_NAMESPACE}" --deployment "${SOLO_DEPLOYMENT}"
+  run_with_spinner "Attaching cluster to deployment" \
+    solo deployment cluster attach --deployment "${SOLO_DEPLOYMENT}" --cluster-ref kind-${SOLO_CLUSTER_NAME} --num-consensus-nodes "${CONSENSUS_NODE_COUNT}"
+  run_with_spinner "Installing Solo cluster prerequisites (Prometheus + MinIO)" \
+    solo cluster-ref config setup -s "${SOLO_CLUSTER_SETUP_NAMESPACE}" --prometheus-stack true
   ensure_grafana_port_forward
+  print_step_complete "Step 1/11"
 else
   print_banner "Resume mode: START_STEP=${START_STEP}; assuming cluster matches end of step $((START_STEP - 1))"
   prepare_js_sdk_runtime
   restart_post_upgrade_port_forwards
   ensure_grafana_port_forward
+  STEP_START_TS=""
 fi
 
 if should_run_step 2; then
   print_banner "Step 2/11: Deploy consensus network at ${INITIAL_RELEASE_TAG} (v0.73.0)"
-  solo keys consensus generate --gossip-keys --tls-keys --deployment "${SOLO_DEPLOYMENT}" -i "${NODE_ALIASES}"
-  solo consensus network deploy --deployment "${SOLO_DEPLOYMENT}" -i "${NODE_ALIASES}" --application-properties "${APP_PROPS_073_FILE}" --log4j2-xml "${LOG4J2_XML_PATH}" --service-monitor true --pod-log true --pvcs true --release-tag "${INITIAL_RELEASE_TAG}"
-  solo consensus node setup --deployment "${SOLO_DEPLOYMENT}" -i "${NODE_ALIASES}" --release-tag "${INITIAL_RELEASE_TAG}"
-  solo consensus node start --deployment "${SOLO_DEPLOYMENT}" -i "${NODE_ALIASES}"
+  run_with_spinner "Generating consensus keys (gossip + tls)" \
+    solo keys consensus generate --gossip-keys --tls-keys --deployment "${SOLO_DEPLOYMENT}" -i "${NODE_ALIASES}"
+  run_with_spinner "Deploying consensus network at ${INITIAL_RELEASE_TAG}" \
+    solo consensus network deploy --deployment "${SOLO_DEPLOYMENT}" -i "${NODE_ALIASES}" --application-properties "${APP_PROPS_073_FILE}" --log4j2-xml "${LOG4J2_XML_PATH}" --service-monitor true --pod-log true --pvcs true --release-tag "${INITIAL_RELEASE_TAG}"
+  run_with_spinner "Setting up consensus nodes (${INITIAL_RELEASE_TAG})" \
+    solo consensus node setup --deployment "${SOLO_DEPLOYMENT}" -i "${NODE_ALIASES}" --release-tag "${INITIAL_RELEASE_TAG}"
+  run_with_spinner "Starting consensus nodes" \
+    solo consensus node start --deployment "${SOLO_DEPLOYMENT}" -i "${NODE_ALIASES}"
   wait_for_consensus_pods_ready 600
   wait_for_haproxy_ready 600
   ensure_solo_service_monitor_for_prometheus
+  print_step_complete "Step 2/11"
 fi
 
 if should_run_step 3; then
   print_banner "Step 3/11: Deploy mirror/explorer and validate baseline transactions"
   deploy_mirror_node_for_cutover
-  solo explorer node add --deployment "${SOLO_DEPLOYMENT}"
+  run_with_spinner "Deploying explorer node" \
+    solo explorer node add --deployment "${SOLO_DEPLOYMENT}"
   if ! start_explorer_ingress_port_forward; then
     echo "WARNING: Explorer UI tunnel is unavailable; explorer may be inaccessible after run." >&2
   fi
@@ -2518,11 +3205,13 @@ if should_run_step 3; then
   export MIRROR_ACCOUNT_WAIT_MS="${MIRROR_ACCOUNT_WAIT_MS:-180000}"
   node "${NODE_SCRIPT}"
   sleep 45
+  print_step_complete "Step 3/11"
 fi
 
 if should_run_step 4; then
   print_banner "Step 4/11: Upgrade consensus network to ${UPGRADE_074_RELEASE_TAG} with 0.74 properties"
-  solo consensus network upgrade --deployment "${SOLO_DEPLOYMENT}" --node-aliases "${NODE_ALIASES}" --upgrade-version "${UPGRADE_074_RELEASE_TAG}" --quiet-mode --force --application-properties "${APP_PROPS_074_FILE}"
+  run_with_spinner "Upgrading consensus network to ${UPGRADE_074_RELEASE_TAG}" \
+    solo consensus network upgrade --deployment "${SOLO_DEPLOYMENT}" --node-aliases "${NODE_ALIASES}" --upgrade-version "${UPGRADE_074_RELEASE_TAG}" --quiet-mode --force --application-properties "${APP_PROPS_074_FILE}"
 
   wait_for_consensus_pods_ready 600
   wait_for_haproxy_ready 600
@@ -2535,6 +3224,7 @@ if should_run_step 4; then
   node "${NODE_SCRIPT}"
 
   sleep 5
+  print_step_complete "Step 4/11"
 fi
 
 if should_run_step 5; then
@@ -2560,11 +3250,13 @@ if should_run_step 5; then
   else
     export JUMPSTART_BLOCK_NUMBER="${MIRROR_BLOCK_NUMBER}"
   fi
+  print_step_complete "Step 5/11"
 fi
 
 if should_run_step 6; then
   print_banner "Step 6/11: Deploy Block Node ${BLOCK_NODE_ID} and link to consensus nodes"
   deploy_block_node_for_cutover
+  print_step_complete "Step 6/11"
 fi
 
 if should_run_step 7; then
@@ -2572,6 +3264,7 @@ if should_run_step 7; then
   create_temp_075_upgrade_properties
   sleep 5
   run_075_upgrade
+  print_step_complete "Step 7/11"
 fi
 
 if should_run_step 8; then
@@ -2586,29 +3279,51 @@ if should_run_step 8; then
     echo "Jumpstart validation failed: migration vote does not match offline replay (see ${MIGRATION_COMPARE_LOG})" >&2
     exit 1
   }
+  print_step_complete "Step 8/11"
 fi
 
-if should_run_step 9; then
-  print_banner "Step 9/11: Update mirror node to read from block-node-${BLOCK_NODE_ID}"
-  update_mirror_node_for_block_cutover
-  echo "Restarting consensus and mirror REST port-forwards"
-  restart_post_upgrade_port_forwards
-  echo "Waiting for mirror REST to respond on http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/blocks?limit=1 (up to 3m)"
-  wait_for_http_ok "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/blocks?limit=1" 36 5
-  # Submit a cryptoCreate via SDK and assert the new account appears in mirror REST.
-  # Validates that the reconfigured importer is reading from the Block Node and
-  # producing accounts queryable through mirror REST after the cutover.
-  echo "Submitting cryptoCreate via SDK and validating mirror visibility (mirror wait up to 3m)"
-  export MIRROR_ACCOUNT_WAIT_MS="${MIRROR_ACCOUNT_WAIT_MS:-180000}"
-  node "${NODE_SCRIPT}"
-fi
-
-#if should_run_step 10; then
-#  print_banner "Step 10/11: Upgrade local build with 0.76 properties as ${UPGRADE_076_VERSION}"
-#  sleep 5
-#  # Still streaming WRBs but TSS is enabled, force mock signatures
-#  run_076_upgrade
+# Step 9 (mirror-node block-cutover) temporarily disabled: BN's earliestManagedBlock
+# is set far above mirror's last imported block, so post-cutover the importer asks BN
+# for a block that's in the missing window (mirror has up to block N, BN starts at
+# N + delta) and stalls with "No block node can provide block N+1". Leaving the
+# importer on the legacy record-stream path until the gap is resolved.
+#if should_run_step 9; then
+#  print_banner "Step 9/11: Update mirror node to read from block-node-${BLOCK_NODE_ID}"
+#  update_mirror_node_for_block_cutover
+#  echo "Restarting consensus and mirror REST port-forwards"
+#  restart_post_upgrade_port_forwards
+#  echo "Waiting for mirror REST to respond on http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/blocks?limit=1 (up to 3m)"
+#  wait_for_http_ok "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/blocks?limit=1" 36 5
+#  # Submit a cryptoCreate via SDK and assert the new account appears in mirror REST.
+#  # Validates that the reconfigured importer is reading from the Block Node and
+#  # producing accounts queryable through mirror REST after the cutover.
+#  echo "Submitting cryptoCreate via SDK and validating mirror visibility (mirror wait up to 3m)"
+#  export MIRROR_ACCOUNT_WAIT_MS="${MIRROR_ACCOUNT_WAIT_MS:-180000}"
+#  node "${NODE_SCRIPT}"
 #fi
+
+if should_run_step 10; then
+  print_banner "Step 10/11: Upgrade local build with 0.76 properties as ${UPGRADE_076_VERSION}"
+  ensure_wraps_artifacts_downloaded
+  if [[ "${SKIP_076_SOLO_UPGRADE:-false}" == "true" ]]; then
+    # Retry path: a prior Step 10 already fired the freeze; the network is now
+    # running on the 0.76 properties on disk but some CNs are missing the
+    # WRAPS env + artifacts. Skip the solo upgrade (which would fail against
+    # an unhealthy network or be a no-op against an already-upgraded one) and
+    # just apply the remedy + verify.
+    log "SKIP_076_SOLO_UPGRADE=true; running WRAPS remedy + verify only (skipping solo network upgrade)"
+    ensure_wraps_proving_key_server
+    apply_wraps_remedy_to_consensus_nodes
+    restart_post_upgrade_port_forwards
+    verify_local_build_on_consensus_nodes
+    verify_wraps_on_consensus_nodes 300
+  else
+    sleep 5
+    # Still streaming WRBs but TSS is enabled, force mock signatures
+    run_076_upgrade
+  fi
+  print_step_complete "Step 10/11"
+fi
 
 
 # ? 0.77 WRBs -> Block Stream BLOCKS only actual cutover
@@ -2623,6 +3338,7 @@ if should_run_step 11; then
   echo "Testing mirror-node readiness via a simple cryptoCreate at end-of-run (wait up to ${MIRROR_ACCOUNT_WAIT_MS:-180000}ms)"
   export MIRROR_ACCOUNT_WAIT_MS="${MIRROR_ACCOUNT_WAIT_MS:-180000}"
   node "${NODE_SCRIPT}"
+  print_step_complete "Step 11/11"
 fi
 start_post_run_keepalive
 print_end_of_run_diagnostics

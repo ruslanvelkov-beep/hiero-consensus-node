@@ -2,7 +2,7 @@
 # Serves wraps proving key tarball over HTTP via Docker/nginx.
 set -euo pipefail
 
-WRAPS_TAR_PATH="${WRAPS_TAR_PATH:-/Users/derektriley/Downloads/wraps-v0.2.0.tar.gz}"
+WRAPS_TAR_PATH="${WRAPS_TAR_PATH:-${HOME}/.solo/cache/wraps-v1.0.0.tar.gz}"
 WRAPS_SERVER_PORT="${WRAPS_SERVER_PORT:-8089}"
 WRAPS_SERVER_CONTAINER_NAME="${WRAPS_SERVER_CONTAINER_NAME:-wraps-proving-key-server}"
 WRAPS_SERVER_IMAGE="${WRAPS_SERVER_IMAGE:-nginx:alpine}"
