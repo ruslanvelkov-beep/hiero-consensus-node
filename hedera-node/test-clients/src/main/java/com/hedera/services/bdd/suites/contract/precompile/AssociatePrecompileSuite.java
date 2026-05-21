@@ -18,6 +18,7 @@ import static com.hedera.services.bdd.spec.transactions.TxnVerbs.contractCall;
 import static com.hedera.services.bdd.spec.transactions.TxnVerbs.contractCreate;
 import static com.hedera.services.bdd.spec.transactions.TxnVerbs.cryptoCreate;
 import static com.hedera.services.bdd.spec.transactions.TxnVerbs.cryptoUpdate;
+import static com.hedera.services.bdd.spec.transactions.TxnVerbs.ethereumCallWithFunctionAbi;
 import static com.hedera.services.bdd.spec.transactions.TxnVerbs.tokenCreate;
 import static com.hedera.services.bdd.spec.transactions.TxnVerbs.uploadInitCode;
 import static com.hedera.services.bdd.spec.utilops.CustomSpecAssert.allRunFor;
@@ -27,9 +28,14 @@ import static com.hedera.services.bdd.spec.utilops.UtilVerbs.newKeyNamed;
 import static com.hedera.services.bdd.spec.utilops.UtilVerbs.sourcing;
 import static com.hedera.services.bdd.spec.utilops.UtilVerbs.withOpContext;
 import static com.hedera.services.bdd.suites.HapiSuite.GENESIS;
+import static com.hedera.services.bdd.suites.HapiSuite.SECP_256K1_SHAPE;
+import static com.hedera.services.bdd.suites.HapiSuite.SECP_256K1_SOURCE_KEY;
+import static com.hedera.services.bdd.suites.HapiSuite.THOUSAND_HBAR;
 import static com.hedera.services.bdd.suites.HapiSuite.flattened;
+import static com.hedera.services.bdd.suites.contract.Utils.FunctionType.FUNCTION;
 import static com.hedera.services.bdd.suites.contract.Utils.asAddress;
 import static com.hedera.services.bdd.suites.contract.Utils.asToken;
+import static com.hedera.services.bdd.suites.contract.Utils.getABIFor;
 import static com.hedera.services.bdd.suites.contract.Utils.idAsHeadlongAddress;
 import static com.hedera.services.bdd.suites.token.TokenAssociationSpecs.VANILLA_TOKEN;
 import static com.hedera.services.bdd.suites.utils.contracts.precompile.HTSPrecompileResult.htsPrecompileResult;
@@ -43,6 +49,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import com.esaulpaugh.headlong.abi.Address;
 import com.hedera.services.bdd.junit.HapiTest;
 import com.hedera.services.bdd.spec.HapiPropertySource;
+import com.hedera.services.bdd.spec.SpecOperation;
 import com.hedera.services.bdd.spec.keys.KeyShape;
 import com.hedera.services.bdd.spec.transactions.contract.HapiParserUtil;
 import com.hederahashgraph.api.proto.java.AccountID;
@@ -51,6 +58,7 @@ import com.hederahashgraph.api.proto.java.TokenType;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
@@ -460,44 +468,63 @@ public class AssociatePrecompileSuite {
                         nullToken, CONTRACT_REVERT_EXECUTED, recordWith().status(INVALID_TOKEN_ID)));
     }
 
+    public static String formatSize(long v) {
+        if (v < 1024) return v + " B";
+        int z = (63 - Long.numberOfLeadingZeros(v)) / 10;
+        return String.format("%.1f %sB", (double) v / (1L << (z * 10)), " KMGTPE".charAt(z));
+    }
+
     //TODO Glib:
     @HapiTest
-    final Stream<DynamicTest> associateTokensLimit() {
-        final int tokensCount = 100;
-        final var trxName = "tokensAssociateTrx";
+    final Stream<DynamicTest> associateTokensHeapTest() {
+        final int tokensCount = 10000;
+        final int iterations = 10;
         final List<Address> tokenAddresses = new ArrayList<>();
         final AtomicReference<Address> accountAddress = new AtomicReference<>();
+        final AtomicLong lastUsed = new AtomicLong();
+        final var function = getABIFor(FUNCTION, "associateTokens", "IHederaTokenService");
         return hapiTest(
                 flattened(
-                        uploadInitCode(INNER_CONTRACT),
-                        contractCreate(INNER_CONTRACT),
-                        newKeyNamed(CONTRACT_KEY).shape(KEY_SHAPE.signedWith(sigs(ON, INNER_CONTRACT))),
                         // create target account
-                        cryptoCreate(ACCOUNT).key(CONTRACT_KEY).exposingEvmAddressTo(accountAddress::set),
+                        newKeyNamed(SECP_256K1_SOURCE_KEY).shape(SECP_256K1_SHAPE),
+                        cryptoCreate(ACCOUNT)
+                                .key(SECP_256K1_SOURCE_KEY)
+                                .balance(THOUSAND_HBAR)
+                                .exposingEvmAddressTo(accountAddress::set),
                         // create tokens
                         cryptoCreate(TOKEN_TREASURY),
                         IntStream.range(0, tokensCount)
                                 .mapToObj(i -> tokenCreate(TOKEN + i)
-                                        .tokenType(TokenType.FUNGIBLE_COMMON)
+                                        .tokenType(FUNGIBLE_COMMON)
                                         .initialSupply(1L)
                                         .supplyKey(TOKEN_TREASURY)
                                         .adminKey(TOKEN_TREASURY)
                                         .treasury(TOKEN_TREASURY)
-                                        .exposingAddressTo(tokenAddresses::add)
+                                        .exposingAddressTo(e -> {
+                                            if (i % 100 == 0) {
+                                                System.out.println("!!!!!!!!!!!!!!! Tokens created: " + i);
+                                            }
+                                            tokenAddresses.add(e);
+                                        })
                                 ).toList(),
                         // execute
-                        sourcing(
-                                () -> contractCall(INNER_CONTRACT, "tokensAssociate", accountAddress.get(), tokenAddresses.toArray(Address[]::new))
-                                        .via(trxName)
-                                        .signingWith(ACCOUNT)
-                                        .gas(100_000_000)
-                        ),
-                        getTxnRecord(trxName)
-                                .exposingTo(e -> {
-                                    System.out.printf("!!!!!!!!!!!!!!!!!! GasUsed:%s Fee:%s\n", e.getContractCallResult()
-                                            .getGasUsed(), e.getTransactionFee());
-                                })
-                                .logged()
+                        withOpContext((spec, ignore) -> {
+                            SpecOperation call = ethereumCallWithFunctionAbi(
+                                    false,
+                                    "0000000000000000000000000000000000000167", //HTS
+                                    function,
+                                    accountAddress.get(), tokenAddresses.toArray(Address[]::new))
+                                    .signingWith(ACCOUNT)
+                                    .hasAnyKnownStatus()
+                                    .exposingGasTo((r, g) -> {
+                                        long heap = Runtime.getRuntime().totalMemory();
+                                        long free = Runtime.getRuntime().freeMemory();
+                                        long used = heap - free;
+                                        System.out.printf("!!!!!!!!!!!!!!! Heap:%s Free:%s Used:%s Diff:%s\n", formatSize(heap), formatSize(free), formatSize(used), formatSize(used - lastUsed.get()));
+                                        lastUsed.set(used);
+                                    });
+                            allRunFor(spec, IntStream.range(0, iterations).mapToObj(i -> call).toList());
+                        })
                 )
         );
     }
