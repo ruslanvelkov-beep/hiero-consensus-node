@@ -285,55 +285,6 @@ verify_local_build_on_consensus_nodes() {
   done
 }
 
-# Minimal recovery for the JAR-staging race in `solo consensus network upgrade
-# --local-build-path`: occasionally a CN JVM starts while Solo's kubectl-cp of
-# the local-build jars is still settling on disk and dies in Log4jSetup with
-# "Property file semantic-version.properties could not be found". The pod
-# stays Running (probes don't catch a crashed JVM), the platform never logs a
-# post-upgrade state, and the network falls below quorum waiting on it.
-#
-# Recovery scope: ONLY re-roll pods whose latest platform-state line in
-# hgcaa.log is still FREEZING / FREEZE_COMPLETE (or empty) — i.e. the
-# post-upgrade JVM never reached REPLAYING_EVENTS. Anything past that we
-# leave alone, even if it ends up CATASTROPHIC_FAILURE or stuck in CHECKING;
-# those are different problems and out of scope for this minimal recovery.
-recover_pods_stuck_pre_replay() {
-  local max_passes="${RECOVER_MAX_PASSES:-2}"
-  local stable_wait_secs="${RECOVER_STABLE_WAIT_SECS:-120}"
-  local pass node pod last_state nodes=() stuck=()
-  IFS=',' read -r -a nodes <<< "${NODE_ALIASES}"
-
-  for ((pass=1; pass<=max_passes; pass++)); do
-    log "JAR-race recovery pass ${pass}/${max_passes}: waiting up to ${stable_wait_secs}s for every CN to log post-upgrade REPLAYING_EVENTS"
-    local deadline=$((SECONDS + stable_wait_secs))
-    while (( SECONDS < deadline )); do
-      stuck=()
-      for node in "${nodes[@]}"; do
-        pod="network-${node}-0"
-        last_state="$(kubectl -n "${SOLO_NAMESPACE}" exec "${pod}" -c root-container -- sh -lc \
-          "grep -oE 'HederaNode#[0-9]+ is [A-Z_]+' ${HAPI_PATH}/output/hgcaa.log 2>/dev/null | tail -1 | awk '{print \$NF}'" 2>/dev/null || true)"
-        case "${last_state}" in
-          ""|FREEZING|FREEZE_COMPLETE) stuck+=("${pod}") ;;
-        esac
-      done
-      if (( ${#stuck[@]} == 0 )); then
-        echo "All CNs have a post-upgrade platform state past FREEZE_COMPLETE"
-        return 0
-      fi
-      sleep 10
-    done
-
-    echo "Pass ${pass}/${max_passes}: re-rolling pods stuck pre-REPLAYING_EVENTS [${stuck[*]}]"
-    for pod in "${stuck[@]}"; do
-      kubectl -n "${SOLO_NAMESPACE}" delete pod "${pod}" >/dev/null 2>&1 || true
-    done
-    wait_for_consensus_pods_ready 600
-  done
-
-  echo "Some CNs did not progress past FREEZE_COMPLETE after ${max_passes} passes" >&2
-  return 1
-}
-
 consensus_pod_wraps_env() {
   local pod="$1"
   kubectl -n "${SOLO_NAMESPACE}" exec "${pod}" -c root-container -- sh -lc \
@@ -670,30 +621,21 @@ upgrade_to_local_076() {
     --force
   )
 
-  # Solo's "Check all nodes are ACTIVE" task fails non-zero when even one CN
-  # hits the JAR-staging race on JVM startup. We swallow that one failure so
-  # we can hand off to recover_pods_stuck_pre_replay below; any other failure
-  # (timeout, deploy validation, etc.) will surface via the recovery's own
-  # non-zero return or the subsequent verify steps.
-  local solo_rc=0
-  set +e
+  # With hiero-ledger/solo#4440 in place, the upgrade stops the JVMs before
+  # the JAR cp and restarts them after, so the previous JAR-staging race is
+  # gone. We let any non-zero Solo exit (timeout, deploy validation, ACTIVE
+  # check failure) propagate via set -e.
   run_command_with_timeout "${SOLO_UPGRADE_TIMEOUT_SECS}" "${upgrade_cmd[@]}"
-  solo_rc=$?
-  set -e
-  log "Solo upgrade returned rc=${solo_rc}"
 
-  log "--- Check 1/3: recover any pods that didn't start the post-upgrade JVM (JAR-staging race) ---"
-  recover_pods_stuck_pre_replay
-
-  log "--- Check 2/4: wait for consensus pods + haproxy + verify local-build version ---"
+  log "--- Check 1/3: wait for consensus pods + haproxy + verify local-build version ---"
   wait_for_consensus_pods_ready 600
   wait_for_haproxy_ready 600
   verify_local_build_on_consensus_nodes
 
-  log "--- Check 3/4: nudge consensus with a few cryptoCreate txns (genesis WRAPS ceremony needs rounds) ---"
+  log "--- Check 2/3: nudge consensus with a few cryptoCreate txns (genesis WRAPS ceremony needs rounds) ---"
   nudge_consensus_with_transactions
 
-  log "--- Check 4/4: verify WRAPS runtime + proof construction on every consensus node ---"
+  log "--- Check 3/3: verify WRAPS runtime + proof construction on every consensus node ---"
   verify_wraps_on_consensus_nodes 600
 }
 
