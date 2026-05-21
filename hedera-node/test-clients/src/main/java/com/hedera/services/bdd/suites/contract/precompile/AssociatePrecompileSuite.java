@@ -27,6 +27,7 @@ import static com.hedera.services.bdd.spec.utilops.UtilVerbs.newKeyNamed;
 import static com.hedera.services.bdd.spec.utilops.UtilVerbs.sourcing;
 import static com.hedera.services.bdd.spec.utilops.UtilVerbs.withOpContext;
 import static com.hedera.services.bdd.suites.HapiSuite.GENESIS;
+import static com.hedera.services.bdd.suites.HapiSuite.flattened;
 import static com.hedera.services.bdd.suites.contract.Utils.asAddress;
 import static com.hedera.services.bdd.suites.contract.Utils.asToken;
 import static com.hedera.services.bdd.suites.contract.Utils.idAsHeadlongAddress;
@@ -47,8 +48,13 @@ import com.hedera.services.bdd.spec.transactions.contract.HapiParserUtil;
 import com.hederahashgraph.api.proto.java.AccountID;
 import com.hederahashgraph.api.proto.java.TokenID;
 import com.hederahashgraph.api.proto.java.TokenType;
+
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.IntStream;
 import java.util.stream.Stream;
+
 import org.junit.jupiter.api.DynamicTest;
 import org.junit.jupiter.api.Tag;
 
@@ -81,10 +87,10 @@ public class AssociatePrecompileSuite {
                 uploadInitCode(THE_GRACEFULLY_FAILING_CONTRACT),
                 contractCreate(THE_GRACEFULLY_FAILING_CONTRACT),
                 contractCall(
-                                THE_GRACEFULLY_FAILING_CONTRACT,
-                                "performLessThanFourBytesFunctionCall",
-                                HapiParserUtil.asHeadlongAddress(ACCOUNT_ADDRESS),
-                                HapiParserUtil.asHeadlongAddress(TOKEN_ADDRESS))
+                        THE_GRACEFULLY_FAILING_CONTRACT,
+                        "performLessThanFourBytesFunctionCall",
+                        HapiParserUtil.asHeadlongAddress(ACCOUNT_ADDRESS),
+                        HapiParserUtil.asHeadlongAddress(TOKEN_ADDRESS))
                         .notTryingAsHexedliteral()
                         .via("Function call with less than 4 bytes txn")
                         .gas(100_000),
@@ -98,13 +104,13 @@ public class AssociatePrecompileSuite {
                 uploadInitCode(THE_GRACEFULLY_FAILING_CONTRACT),
                 contractCreate(THE_GRACEFULLY_FAILING_CONTRACT),
                 contractCall(
-                                THE_GRACEFULLY_FAILING_CONTRACT,
-                                "performInvalidlyFormattedFunctionCall",
-                                HapiParserUtil.asHeadlongAddress(ACCOUNT_ADDRESS),
-                                new Address[] {
-                                    HapiParserUtil.asHeadlongAddress(TOKEN_ADDRESS),
-                                    HapiParserUtil.asHeadlongAddress(TOKEN_ADDRESS)
-                                })
+                        THE_GRACEFULLY_FAILING_CONTRACT,
+                        "performInvalidlyFormattedFunctionCall",
+                        HapiParserUtil.asHeadlongAddress(ACCOUNT_ADDRESS),
+                        new Address[]{
+                                HapiParserUtil.asHeadlongAddress(TOKEN_ADDRESS),
+                                HapiParserUtil.asHeadlongAddress(TOKEN_ADDRESS)
+                        })
                         .notTryingAsHexedliteral()
                         .via("Invalid Abi Function call txn"),
                 childRecordsCheck("Invalid Abi Function call txn", SUCCESS));
@@ -117,10 +123,10 @@ public class AssociatePrecompileSuite {
                 uploadInitCode(THE_GRACEFULLY_FAILING_CONTRACT),
                 contractCreate(THE_GRACEFULLY_FAILING_CONTRACT),
                 contractCall(
-                                THE_GRACEFULLY_FAILING_CONTRACT,
-                                "performNonExistingServiceFunctionCall",
-                                HapiParserUtil.asHeadlongAddress(ACCOUNT_ADDRESS),
-                                HapiParserUtil.asHeadlongAddress(TOKEN_ADDRESS))
+                        THE_GRACEFULLY_FAILING_CONTRACT,
+                        "performNonExistingServiceFunctionCall",
+                        HapiParserUtil.asHeadlongAddress(ACCOUNT_ADDRESS),
+                        HapiParserUtil.asHeadlongAddress(TOKEN_ADDRESS))
                         .notTryingAsHexedliteral()
                         .via("nonExistingFunctionCallTxn"),
                 childRecordsCheck("nonExistingFunctionCallTxn", SUCCESS));
@@ -146,18 +152,18 @@ public class AssociatePrecompileSuite {
                         newKeyNamed(DELEGATE_KEY).shape(DELEGATE_CONTRACT_KEY_SHAPE.signedWith(sigs(ON, THE_CONTRACT))),
                         cryptoUpdate(ACCOUNT).key(DELEGATE_KEY),
                         contractCall(
-                                        THE_CONTRACT,
-                                        "nonSupportedFunction",
-                                        HapiParserUtil.asHeadlongAddress(asAddress(accountID.get())),
-                                        HapiParserUtil.asHeadlongAddress(asAddress(vanillaTokenID.get())))
+                                THE_CONTRACT,
+                                "nonSupportedFunction",
+                                HapiParserUtil.asHeadlongAddress(asAddress(accountID.get())),
+                                HapiParserUtil.asHeadlongAddress(asAddress(vanillaTokenID.get())))
                                 .payingWith(GENESIS)
                                 .via("notSupportedFunctionCallTxn")
                                 .hasKnownStatus(CONTRACT_REVERT_EXECUTED),
                         contractCall(
-                                        THE_CONTRACT,
-                                        TOKEN_ASSOCIATE_FUNCTION,
-                                        HapiParserUtil.asHeadlongAddress(asAddress(accountID.get())),
-                                        HapiParserUtil.asHeadlongAddress(asAddress(vanillaTokenID.get())))
+                                THE_CONTRACT,
+                                TOKEN_ASSOCIATE_FUNCTION,
+                                HapiParserUtil.asHeadlongAddress(asAddress(accountID.get())),
+                                HapiParserUtil.asHeadlongAddress(asAddress(vanillaTokenID.get())))
                                 .payingWith(GENESIS)
                                 .via(VANILLA_TOKEN_ASSOCIATE_TXN)
                                 .gas(GAS_TO_OFFER))),
@@ -194,19 +200,19 @@ public class AssociatePrecompileSuite {
                         newKeyNamed(DELEGATE_KEY).shape(DELEGATE_CONTRACT_KEY_SHAPE.signedWith(sigs(ON, THE_CONTRACT))),
                         cryptoUpdate(ACCOUNT).key(DELEGATE_KEY),
                         contractCall(
-                                        THE_CONTRACT,
-                                        TOKEN_ASSOCIATE_FUNCTION,
-                                        HapiParserUtil.asHeadlongAddress(asAddress(accountID.get())),
-                                        HapiParserUtil.asHeadlongAddress(invalidAbiArgument))
+                                THE_CONTRACT,
+                                TOKEN_ASSOCIATE_FUNCTION,
+                                HapiParserUtil.asHeadlongAddress(asAddress(accountID.get())),
+                                HapiParserUtil.asHeadlongAddress(invalidAbiArgument))
                                 .payingWith(GENESIS)
                                 .via("functionCallWithInvalidArgumentTxn")
                                 .gas(GAS_TO_OFFER)
                                 .hasKnownStatus(CONTRACT_REVERT_EXECUTED),
                         contractCall(
-                                        THE_CONTRACT,
-                                        TOKEN_ASSOCIATE_FUNCTION,
-                                        HapiParserUtil.asHeadlongAddress(asAddress(accountID.get())),
-                                        HapiParserUtil.asHeadlongAddress(asAddress(vanillaTokenID.get())))
+                                THE_CONTRACT,
+                                TOKEN_ASSOCIATE_FUNCTION,
+                                HapiParserUtil.asHeadlongAddress(asAddress(accountID.get())),
+                                HapiParserUtil.asHeadlongAddress(asAddress(vanillaTokenID.get())))
                                 .payingWith(GENESIS)
                                 .via(VANILLA_TOKEN_ASSOCIATE_TXN)
                                 .gas(GAS_TO_OFFER))),
@@ -260,9 +266,9 @@ public class AssociatePrecompileSuite {
                 uploadInitCode(THE_GRACEFULLY_FAILING_CONTRACT),
                 contractCreate(THE_GRACEFULLY_FAILING_CONTRACT),
                 contractCall(
-                                THE_GRACEFULLY_FAILING_CONTRACT,
-                                "performInvalidlyFormattedSingleFunctionCall",
-                                HapiParserUtil.asHeadlongAddress(ACCOUNT_ADDRESS))
+                        THE_GRACEFULLY_FAILING_CONTRACT,
+                        "performInvalidlyFormattedSingleFunctionCall",
+                        HapiParserUtil.asHeadlongAddress(ACCOUNT_ADDRESS))
                         .notTryingAsHexedliteral()
                         .via(INVALID_SINGLE_ABI_CALL_TXN)
                         .hasKnownStatus(CONTRACT_REVERT_EXECUTED),
@@ -309,9 +315,9 @@ public class AssociatePrecompileSuite {
                 withOpContext((spec, custom) -> allRunFor(
                         spec,
                         contractCall(
-                                        NEGATIVE_ASSOCIATIONS_CONTRACT,
-                                        "associateTokensWithNonExistingAccountAddress",
-                                        (Object) new Address[] {tokenAddress1.get(), tokenAddress2.get()})
+                                NEGATIVE_ASSOCIATIONS_CONTRACT,
+                                "associateTokensWithNonExistingAccountAddress",
+                                (Object) new Address[]{tokenAddress1.get(), tokenAddress2.get()})
                                 .hasKnownStatus(CONTRACT_REVERT_EXECUTED)
                                 .gas(GAS_TO_OFFER)
                                 .via(nonExistingAccount)
@@ -321,9 +327,9 @@ public class AssociatePrecompileSuite {
                         newKeyNamed(CONTRACT_KEY).shape(KEY_SHAPE.signedWith(sigs(ON, NEGATIVE_ASSOCIATIONS_CONTRACT))),
                         cryptoUpdate(ACCOUNT).key(CONTRACT_KEY),
                         contractCall(
-                                        NEGATIVE_ASSOCIATIONS_CONTRACT,
-                                        "associateTokensWithEmptyTokensArray",
-                                        accountAddress.get())
+                                NEGATIVE_ASSOCIATIONS_CONTRACT,
+                                "associateTokensWithEmptyTokensArray",
+                                accountAddress.get())
                                 // match mono behaviour, this is a successful call, but it should not associate any
                                 // tokens
                                 .hasKnownStatus(SUCCESS)
@@ -332,7 +338,7 @@ public class AssociatePrecompileSuite {
                                 .via(nonExistingTokenArray)
                                 .logged(),
                         contractCall(NEGATIVE_ASSOCIATIONS_CONTRACT, "associateTokensWithNullAccount", (Object)
-                                        new Address[] {tokenAddress1.get(), tokenAddress2.get()})
+                                new Address[]{tokenAddress1.get(), tokenAddress2.get()})
                                 .hasKnownStatus(CONTRACT_REVERT_EXECUTED)
                                 .gas(GAS_TO_OFFER)
                                 .via(zeroAccountAddress)
@@ -340,28 +346,28 @@ public class AssociatePrecompileSuite {
                         getAccountInfo(ACCOUNT).hasNoTokenRelationship(TOKEN),
                         getAccountInfo(ACCOUNT).hasNoTokenRelationship(TOKEN1),
                         contractCall(
-                                        NEGATIVE_ASSOCIATIONS_CONTRACT,
-                                        "associateTokensWithNullTokensArray",
-                                        accountAddress.get())
+                                NEGATIVE_ASSOCIATIONS_CONTRACT,
+                                "associateTokensWithNullTokensArray",
+                                accountAddress.get())
                                 .hasKnownStatus(CONTRACT_REVERT_EXECUTED)
                                 .gas(GAS_TO_OFFER)
                                 .signingWith(ACCOUNT)
                                 .via(nullTokenArray)
                                 .logged(),
                         contractCall(
-                                        NEGATIVE_ASSOCIATIONS_CONTRACT,
-                                        "associateTokensWithNonExistingTokensArray",
-                                        accountAddress.get())
+                                NEGATIVE_ASSOCIATIONS_CONTRACT,
+                                "associateTokensWithNonExistingTokensArray",
+                                accountAddress.get())
                                 .hasKnownStatus(CONTRACT_REVERT_EXECUTED)
                                 .gas(GAS_TO_OFFER)
                                 .signingWith(ACCOUNT)
                                 .via(nonExistingTokensInArray)
                                 .logged(),
                         contractCall(
-                                        NEGATIVE_ASSOCIATIONS_CONTRACT,
-                                        "associateTokensWithTokensArrayWithSomeNonExistingAddresses",
-                                        accountAddress.get(),
-                                        new Address[] {tokenAddress1.get(), tokenAddress2.get()})
+                                NEGATIVE_ASSOCIATIONS_CONTRACT,
+                                "associateTokensWithTokensArrayWithSomeNonExistingAddresses",
+                                accountAddress.get(),
+                                new Address[]{tokenAddress1.get(), tokenAddress2.get()})
                                 .hasKnownStatus(SUCCESS)
                                 .gas(GAS_TO_OFFER)
                                 .signingWith(ACCOUNT)
@@ -409,36 +415,36 @@ public class AssociatePrecompileSuite {
                         newKeyNamed(CONTRACT_KEY).shape(KEY_SHAPE.signedWith(sigs(ON, NEGATIVE_ASSOCIATIONS_CONTRACT))),
                         cryptoUpdate(ACCOUNT).key(CONTRACT_KEY),
                         contractCall(
-                                        NEGATIVE_ASSOCIATIONS_CONTRACT,
-                                        "associateTokenWithNonExistingAccount",
-                                        tokenAddress.get())
+                                NEGATIVE_ASSOCIATIONS_CONTRACT,
+                                "associateTokenWithNonExistingAccount",
+                                tokenAddress.get())
                                 .hasKnownStatus(CONTRACT_REVERT_EXECUTED)
                                 .gas(GAS_TO_OFFER)
                                 .via(nonExistingAccount)
                                 .logged(),
                         getAccountInfo(ACCOUNT).hasNoTokenRelationship(TOKEN),
                         contractCall(
-                                        NEGATIVE_ASSOCIATIONS_CONTRACT,
-                                        "associateTokenWithNullAccount",
-                                        tokenAddress.get())
+                                NEGATIVE_ASSOCIATIONS_CONTRACT,
+                                "associateTokenWithNullAccount",
+                                tokenAddress.get())
                                 .hasKnownStatus(CONTRACT_REVERT_EXECUTED)
                                 .gas(GAS_TO_OFFER)
                                 .via(nullAccount)
                                 .logged(),
                         getAccountInfo(ACCOUNT).hasNoTokenRelationship(TOKEN),
                         contractCall(
-                                        NEGATIVE_ASSOCIATIONS_CONTRACT,
-                                        "associateTokenWithNonExistingTokenAddress",
-                                        accountAddress.get())
+                                NEGATIVE_ASSOCIATIONS_CONTRACT,
+                                "associateTokenWithNonExistingTokenAddress",
+                                accountAddress.get())
                                 .hasKnownStatus(CONTRACT_REVERT_EXECUTED)
                                 .gas(GAS_TO_OFFER)
                                 .via(nonExistingToken)
                                 .logged(),
                         getAccountInfo(ACCOUNT).hasNoTokenRelationship(TOKEN),
                         contractCall(
-                                        NEGATIVE_ASSOCIATIONS_CONTRACT,
-                                        "associateTokenWithNullTokenAddress",
-                                        accountAddress.get())
+                                NEGATIVE_ASSOCIATIONS_CONTRACT,
+                                "associateTokenWithNullTokenAddress",
+                                accountAddress.get())
                                 .hasKnownStatus(CONTRACT_REVERT_EXECUTED)
                                 .gas(GAS_TO_OFFER)
                                 .via(nullToken)
@@ -457,21 +463,42 @@ public class AssociatePrecompileSuite {
     //TODO Glib:
     @HapiTest
     final Stream<DynamicTest> associateTokensLimit() {
-        final AtomicReference<Address> tokenAddress = new AtomicReference<>();
+        final int tokensCount = 100;
+        final var trxName = "tokensAssociateTrx";
+        final List<Address> tokenAddresses = new ArrayList<>();
         final AtomicReference<Address> accountAddress = new AtomicReference<>();
         return hapiTest(
-                uploadInitCode(INNER_CONTRACT),
-                contractCreate(INNER_CONTRACT),
-                cryptoCreate(TOKEN_TREASURY),
-                tokenCreate(TOKEN)
-                        .tokenType(TokenType.FUNGIBLE_COMMON)
-                        .initialSupply(50L)
-                        .supplyKey(TOKEN_TREASURY)
-                        .adminKey(TOKEN_TREASURY)
-                        .treasury(TOKEN_TREASURY)
-                        .exposingAddressTo(tokenAddress::set),
-                cryptoCreate(ACCOUNT).exposingCreatedIdTo(id -> accountAddress.set(idAsHeadlongAddress(id)))
-
+                flattened(
+                        uploadInitCode(INNER_CONTRACT),
+                        contractCreate(INNER_CONTRACT),
+                        newKeyNamed(CONTRACT_KEY).shape(KEY_SHAPE.signedWith(sigs(ON, INNER_CONTRACT))),
+                        // create target account
+                        cryptoCreate(ACCOUNT).key(CONTRACT_KEY).exposingEvmAddressTo(accountAddress::set),
+                        // create tokens
+                        cryptoCreate(TOKEN_TREASURY),
+                        IntStream.range(0, tokensCount)
+                                .mapToObj(i -> tokenCreate(TOKEN + i)
+                                        .tokenType(TokenType.FUNGIBLE_COMMON)
+                                        .initialSupply(1L)
+                                        .supplyKey(TOKEN_TREASURY)
+                                        .adminKey(TOKEN_TREASURY)
+                                        .treasury(TOKEN_TREASURY)
+                                        .exposingAddressTo(tokenAddresses::add)
+                                ).toList(),
+                        // execute
+                        sourcing(
+                                () -> contractCall(INNER_CONTRACT, "tokensAssociate", accountAddress.get(), tokenAddresses.toArray(Address[]::new))
+                                        .via(trxName)
+                                        .signingWith(ACCOUNT)
+                                        .gas(100_000_000)
+                        ),
+                        getTxnRecord(trxName)
+                                .exposingTo(e -> {
+                                    System.out.printf("!!!!!!!!!!!!!!!!!! GasUsed:%s Fee:%s\n", e.getContractCallResult()
+                                            .getGasUsed(), e.getTransactionFee());
+                                })
+                                .logged()
                 )
+        );
     }
 }
