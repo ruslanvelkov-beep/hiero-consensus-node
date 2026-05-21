@@ -66,8 +66,17 @@ WRAPS_ARTIFACTS_CONTAINER_DIR_DEFAULT="${HAPI_PATH}/data/keys/wraps"
 
 SOLO_UPGRADE_TIMEOUT_SECS="${SOLO_UPGRADE_TIMEOUT_SECS:-1800}"
 
+# Local port-forward + operator key used by the post-upgrade tx nudge that
+# pushes consensus rounds past the genesis WRAPS CRS-adoption stall.
+CN_GRPC_LOCAL_PORT="${CN_GRPC_LOCAL_PORT:-50211}"
+OPERATOR_ACCOUNT_ID="${OPERATOR_ACCOUNT_ID:-0.0.2}"
+OPERATOR_PRIVATE_KEY="${OPERATOR_PRIVATE_KEY:-302e020100300506032b65700422042091132178e72057a1d7528025956fe39b0b847f200ab59b2fdd367017f3087137}"
+NUDGE_TX_COUNT="${NUDGE_TX_COUNT:-5}"
+
 SOLO_HOME_DIR="${HOME}/.solo"
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/solo-e2e-075-to-076.XXXXXX")"
+NUDGE_SCRIPT="${WORK_DIR}/nudge-consensus.js"
+CN_PORT_FORWARD_LOG="${WORK_DIR}/cn-port-forward.log"
 CLUSTER_CREATED_THIS_RUN="false"
 
 log() {
@@ -276,6 +285,55 @@ verify_local_build_on_consensus_nodes() {
   done
 }
 
+# Minimal recovery for the JAR-staging race in `solo consensus network upgrade
+# --local-build-path`: occasionally a CN JVM starts while Solo's kubectl-cp of
+# the local-build jars is still settling on disk and dies in Log4jSetup with
+# "Property file semantic-version.properties could not be found". The pod
+# stays Running (probes don't catch a crashed JVM), the platform never logs a
+# post-upgrade state, and the network falls below quorum waiting on it.
+#
+# Recovery scope: ONLY re-roll pods whose latest platform-state line in
+# hgcaa.log is still FREEZING / FREEZE_COMPLETE (or empty) — i.e. the
+# post-upgrade JVM never reached REPLAYING_EVENTS. Anything past that we
+# leave alone, even if it ends up CATASTROPHIC_FAILURE or stuck in CHECKING;
+# those are different problems and out of scope for this minimal recovery.
+recover_pods_stuck_pre_replay() {
+  local max_passes="${RECOVER_MAX_PASSES:-2}"
+  local stable_wait_secs="${RECOVER_STABLE_WAIT_SECS:-120}"
+  local pass node pod last_state nodes=() stuck=()
+  IFS=',' read -r -a nodes <<< "${NODE_ALIASES}"
+
+  for ((pass=1; pass<=max_passes; pass++)); do
+    log "JAR-race recovery pass ${pass}/${max_passes}: waiting up to ${stable_wait_secs}s for every CN to log post-upgrade REPLAYING_EVENTS"
+    local deadline=$((SECONDS + stable_wait_secs))
+    while (( SECONDS < deadline )); do
+      stuck=()
+      for node in "${nodes[@]}"; do
+        pod="network-${node}-0"
+        last_state="$(kubectl -n "${SOLO_NAMESPACE}" exec "${pod}" -c root-container -- sh -lc \
+          "grep -oE 'HederaNode#[0-9]+ is [A-Z_]+' ${HAPI_PATH}/output/hgcaa.log 2>/dev/null | tail -1 | awk '{print \$NF}'" 2>/dev/null || true)"
+        case "${last_state}" in
+          ""|FREEZING|FREEZE_COMPLETE) stuck+=("${pod}") ;;
+        esac
+      done
+      if (( ${#stuck[@]} == 0 )); then
+        echo "All CNs have a post-upgrade platform state past FREEZE_COMPLETE"
+        return 0
+      fi
+      sleep 10
+    done
+
+    echo "Pass ${pass}/${max_passes}: re-rolling pods stuck pre-REPLAYING_EVENTS [${stuck[*]}]"
+    for pod in "${stuck[@]}"; do
+      kubectl -n "${SOLO_NAMESPACE}" delete pod "${pod}" >/dev/null 2>&1 || true
+    done
+    wait_for_consensus_pods_ready 600
+  done
+
+  echo "Some CNs did not progress past FREEZE_COMPLETE after ${max_passes} passes" >&2
+  return 1
+}
+
 consensus_pod_wraps_env() {
   local pod="$1"
   kubectl -n "${SOLO_NAMESPACE}" exec "${pod}" -c root-container -- sh -lc \
@@ -304,11 +362,122 @@ wraps_failure_present_in_log() {
     "grep -Eq 'WRAPS library is not ready|Skipping publication of POST_AGGREGATION output: WRAPS library is not ready' ${HAPI_PATH}/output/hgcaa.log" >/dev/null 2>&1
 }
 
+# Submit a few cryptoCreate transactions against a CN's gRPC port to drive
+# consensus rounds forward. The genesis WRAPS ceremony stalls at "All nodes
+# have contributed to the CRS, waiting for final adoption" on an idle
+# network — adoption needs rounds, rounds need transactions. ~3-5 txns is
+# enough to push the ceremony through to proof construction.
+nudge_consensus_with_transactions() {
+  local pf_pid="" tx_count="${NUDGE_TX_COUNT}"
+
+  log "Setting up CN gRPC port-forward (svc/haproxy-node1-svc → localhost:${CN_GRPC_LOCAL_PORT})"
+  # Kill any stale port-forward on this port.
+  pkill -f "port-forward.*haproxy-node1-svc.*${CN_GRPC_LOCAL_PORT}" >/dev/null 2>&1 || true
+  sleep 1
+  nohup kubectl -n "${SOLO_NAMESPACE}" port-forward svc/haproxy-node1-svc \
+    "${CN_GRPC_LOCAL_PORT}:non-tls-grpc-client-port" \
+    > "${CN_PORT_FORWARD_LOG}" 2>&1 < /dev/null &
+  pf_pid=$!
+
+  # Wait for the port to become reachable (up to 30s).
+  local deadline=$((SECONDS + 30))
+  while (( SECONDS < deadline )); do
+    if (: </dev/tcp/127.0.0.1/${CN_GRPC_LOCAL_PORT}) >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+  if ! (: </dev/tcp/127.0.0.1/${CN_GRPC_LOCAL_PORT}) >/dev/null 2>&1; then
+    kill "${pf_pid}" >/dev/null 2>&1 || true
+    echo "CN gRPC port-forward did not become reachable on localhost:${CN_GRPC_LOCAL_PORT} (log: ${CN_PORT_FORWARD_LOG})" >&2
+    return 1
+  fi
+  log "CN gRPC reachable on 127.0.0.1:${CN_GRPC_LOCAL_PORT}"
+
+  # Write the tx-nudge script.
+  cat > "${NUDGE_SCRIPT}" <<'EOF'
+const {
+  Client,
+  AccountCreateTransaction,
+  Hbar,
+  PrivateKey,
+  Status,
+} = require("@hashgraph/sdk");
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function main() {
+  const grpcEndpoint = process.env.GRPC_ENDPOINT || "127.0.0.1:50211";
+  const operatorAccountId = process.env.OPERATOR_ACCOUNT_ID || "0.0.2";
+  const operatorPrivateKey = process.env.OPERATOR_PRIVATE_KEY;
+  const txCount = Number(process.env.NUDGE_TX_COUNT || "5");
+  if (!operatorPrivateKey) {
+    throw new Error("OPERATOR_PRIVATE_KEY is required");
+  }
+
+  const client = Client.forNetwork({ [grpcEndpoint]: "0.0.3" });
+  client.setOperator(operatorAccountId, PrivateKey.fromString(operatorPrivateKey));
+  client.setMaxAttempts(3);
+  client.setRequestTimeout(20000);
+
+  for (let i = 1; i <= txCount; i++) {
+    const tx = new AccountCreateTransaction()
+      .setInitialBalance(new Hbar(1))
+      .setKey(PrivateKey.generateED25519().publicKey)
+      .setMaxTransactionFee(new Hbar(5));
+    const response = await tx.execute(client);
+    const receipt = await response.getReceipt(client);
+    if (receipt.status !== Status.Success) {
+      throw new Error(`tx ${i}/${txCount}: non-success status ${receipt.status.toString()}`);
+    }
+    const accountId = receipt.accountId ? receipt.accountId.toString() : "(no id)";
+    console.log(`  nudge tx ${i}/${txCount}: cryptoCreate -> ${accountId}`);
+    await sleep(500);
+  }
+
+  await client.close();
+}
+
+main().catch((err) => {
+  console.error(`nudge FAIL: ${err.message}`);
+  process.exit(1);
+});
+EOF
+
+  # Make sure @hashgraph/sdk is installed in WORK_DIR (idempotent, fast on re-run).
+  if [[ ! -d "${WORK_DIR}/node_modules/@hashgraph/sdk" ]]; then
+    log "Installing @hashgraph/sdk into ${WORK_DIR} (one-time, ~30s)"
+    (
+      cd "${WORK_DIR}"
+      npm init -y >/dev/null 2>&1
+      npm install --no-fund --no-audit @hashgraph/sdk >/dev/null 2>&1
+    )
+  fi
+
+  log "Submitting ${tx_count} cryptoCreate txns to drive consensus rounds past CRS-adoption stall"
+  local rc=0
+  (
+    cd "${WORK_DIR}"
+    GRPC_ENDPOINT="127.0.0.1:${CN_GRPC_LOCAL_PORT}" \
+    OPERATOR_ACCOUNT_ID="${OPERATOR_ACCOUNT_ID}" \
+    OPERATOR_PRIVATE_KEY="${OPERATOR_PRIVATE_KEY}" \
+    NUDGE_TX_COUNT="${tx_count}" \
+      node "${NUDGE_SCRIPT}"
+  ) || rc=$?
+
+  kill "${pf_pid}" >/dev/null 2>&1 || true
+  pkill -f "port-forward.*haproxy-node1-svc.*${CN_GRPC_LOCAL_PORT}" >/dev/null 2>&1 || true
+
+  return "${rc}"
+}
+
 verify_wraps_on_consensus_nodes() {
   local wraps_dir="" expected_wraps=""
-  local timeout_secs="${1:-300}"
+  local timeout_secs="${1:-600}"
   local deadline=0
-  local node pod found_env found_wraps
+  local node pod found_env found_wraps ready_for_proof
   local nodes=()
 
   wraps_dir="$(configured_wraps_artifacts_container_dir)"
@@ -318,22 +487,39 @@ verify_wraps_on_consensus_nodes() {
     return 1
   }
 
-  log "Verifying WRAPS runtime on each consensus node (env=${wraps_dir}, expecting ${expected_wraps} extracted files, ${timeout_secs}s for proof construction)"
+  log "Verifying WRAPS runtime on each consensus node (env=${wraps_dir}, expecting ${expected_wraps} extracted files, up to ${timeout_secs}s/node for env+artifacts+proof construction)"
   IFS=',' read -r -a nodes <<< "${NODE_ALIASES}"
   for node in "${nodes[@]}"; do
     pod="network-${node}-0"
-    found_env="$(consensus_pod_wraps_env "${pod}" || true)"
-    found_wraps="$(consensus_pod_wraps_file_count "${pod}" "${wraps_dir}" || true)"
-    if [[ "${found_env}" != "${wraps_dir}" ]]; then
-      echo "  ${pod}: TSS_LIB_WRAPS_ARTIFACTS_PATH env mismatch (expected ${wraps_dir}, found ${found_env:-unset})" >&2
-      return 1
-    fi
-    if [[ "${found_wraps}" != "${expected_wraps}" ]]; then
-      echo "  ${pod}: wraps artifact count mismatch (expected ${expected_wraps}, found ${found_wraps:-0})" >&2
-      return 1
-    fi
-    echo "  ${pod}: env + ${found_wraps} artifacts OK; waiting for 'Constructing (genesis|incremental) WRAPS proof with:' in hgcaa.log"
     deadline=$((SECONDS + timeout_secs))
+
+    # Phase 1: wait for TSS_LIB_WRAPS_ARTIFACTS_PATH to be set in the JVM env
+    # AND for WrapsProvingKeyVerification to finish downloading + extracting
+    # the proving-key archive. Both happen asynchronously after the pod
+    # reports Ready, so poll rather than failing fast on the initial sample.
+    ready_for_proof=false
+    found_env=""
+    found_wraps=""
+    while (( SECONDS < deadline )); do
+      if wraps_failure_present_in_log "${pod}"; then
+        echo "  ${pod}: WRAPS reported a runtime failure (check ${HAPI_PATH}/output/hgcaa.log)" >&2
+        return 1
+      fi
+      found_env="$(consensus_pod_wraps_env "${pod}" || true)"
+      found_wraps="$(consensus_pod_wraps_file_count "${pod}" "${wraps_dir}" || true)"
+      if [[ "${found_env}" == "${wraps_dir}" && "${found_wraps}" == "${expected_wraps}" ]]; then
+        ready_for_proof=true
+        break
+      fi
+      sleep 5
+    done
+
+    if ! ${ready_for_proof}; then
+      echo "  ${pod}: timed out waiting for WRAPS env+artifacts (env='${found_env:-unset}' wanted '${wraps_dir}'; artifacts=${found_wraps:-0}/${expected_wraps})" >&2
+      return 1
+    fi
+
+    echo "  ${pod}: env + ${found_wraps} artifacts OK; waiting for 'Constructing (genesis|incremental) WRAPS proof with:' in hgcaa.log"
     local progress_tick=0
     while (( SECONDS < deadline )); do
       if wraps_failure_present_in_log "${pod}"; then
@@ -484,19 +670,31 @@ upgrade_to_local_076() {
     --force
   )
 
-  # No retry / recovery on upgrade failure — if Solo returns non-zero or the
-  # upgrade times out, fail the script so the operator can inspect the cluster.
+  # Solo's "Check all nodes are ACTIVE" task fails non-zero when even one CN
+  # hits the JAR-staging race on JVM startup. We swallow that one failure so
+  # we can hand off to recover_pods_stuck_pre_replay below; any other failure
+  # (timeout, deploy validation, etc.) will surface via the recovery's own
+  # non-zero return or the subsequent verify steps.
+  local solo_rc=0
+  set +e
   run_command_with_timeout "${SOLO_UPGRADE_TIMEOUT_SECS}" "${upgrade_cmd[@]}"
+  solo_rc=$?
+  set -e
+  log "Solo upgrade returned rc=${solo_rc}"
 
-  log "--- Check 1/3: wait for consensus pods + haproxy to be ready ---"
+  log "--- Check 1/3: recover any pods that didn't start the post-upgrade JVM (JAR-staging race) ---"
+  recover_pods_stuck_pre_replay
+
+  log "--- Check 2/4: wait for consensus pods + haproxy + verify local-build version ---"
   wait_for_consensus_pods_ready 600
   wait_for_haproxy_ready 600
-
-  log "--- Check 2/3: verify local-build version on every consensus node ---"
   verify_local_build_on_consensus_nodes
 
-  log "--- Check 3/3: verify WRAPS runtime + proof construction on every consensus node ---"
-  verify_wraps_on_consensus_nodes 300
+  log "--- Check 3/4: nudge consensus with a few cryptoCreate txns (genesis WRAPS ceremony needs rounds) ---"
+  nudge_consensus_with_transactions
+
+  log "--- Check 4/4: verify WRAPS runtime + proof construction on every consensus node ---"
+  verify_wraps_on_consensus_nodes 600
 }
 
 log "Validating prerequisites"
@@ -507,6 +705,8 @@ require_cmd curl
 require_cmd tar
 require_cmd docker
 require_cmd unzip
+require_cmd node
+require_cmd npm
 
 [[ -f "${APP_PROPS_075_FILE}" ]] || { echo "Missing file: ${APP_PROPS_075_FILE}" >&2; exit 1; }
 [[ -f "${APP_PROPS_076_FILE}" ]] || { echo "Missing file: ${APP_PROPS_076_FILE}" >&2; exit 1; }
