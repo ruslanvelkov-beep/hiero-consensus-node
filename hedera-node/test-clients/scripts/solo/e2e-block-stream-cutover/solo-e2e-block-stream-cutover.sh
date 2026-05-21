@@ -1346,12 +1346,13 @@ wraps_failure_present_in_log() {
 verify_wraps_on_consensus_nodes() {
   local wraps_dir=""
   local expected_wraps=""
-  local timeout_secs="${1:-300}"
+  local timeout_secs="${1:-600}"
   local deadline=0
   local node=""
   local pod=""
   local found_env=""
   local found_wraps=""
+  local ready_for_proof=false
   local nodes=()
 
   wraps_dir="$(configured_wraps_artifacts_container_dir)"
@@ -1361,22 +1362,40 @@ verify_wraps_on_consensus_nodes() {
     return 1
   }
 
-  echo "Verifying WRAPS runtime on each consensus node (env=${wraps_dir}, expecting ${expected_wraps} extracted files, ${timeout_secs}s for proof construction)"
+  echo "Verifying WRAPS runtime on each consensus node (env=${wraps_dir}, expecting ${expected_wraps} extracted files, up to ${timeout_secs}s/node for env+artifacts+proof construction)"
   IFS=',' read -r -a nodes <<< "${NODE_ALIASES}"
   for node in "${nodes[@]}"; do
     pod="network-${node}-0"
-    found_env="$(consensus_pod_wraps_env "${pod}" || true)"
-    found_wraps="$(consensus_pod_wraps_file_count "${pod}" "${wraps_dir}" || true)"
-    if [[ "${found_env}" != "${wraps_dir}" ]]; then
-      echo "  ${pod}: TSS_LIB_WRAPS_ARTIFACTS_PATH env mismatch (expected ${wraps_dir}, found ${found_env:-unset})" >&2
-      return 1
-    fi
-    if [[ "${found_wraps}" != "${expected_wraps}" ]]; then
-      echo "  ${pod}: wraps artifact count mismatch (expected ${expected_wraps}, found ${found_wraps:-0})" >&2
-      return 1
-    fi
-    echo "  ${pod}: env + ${found_wraps} artifacts OK; waiting for 'Constructing (genesis|incremental) WRAPS proof with:' in hgcaa.log"
     deadline=$((SECONDS + timeout_secs))
+
+    # Phase 1: poll for TSS_LIB_WRAPS_ARTIFACTS_PATH to be set in the JVM
+    # env AND for WrapsProvingKeyVerification to finish extracting the
+    # proving-key archive. Both happen asynchronously after the pod reports
+    # Ready, so a single sample at t=0 may catch the JVM mid-extract with
+    # only a partial file count — poll rather than failing fast.
+    ready_for_proof=false
+    found_env=""
+    found_wraps=""
+    while (( SECONDS < deadline )); do
+      if wraps_failure_present_in_log "${pod}"; then
+        echo "  ${pod}: WRAPS reported a runtime failure (check ${HAPI_PATH}/output/hgcaa.log)" >&2
+        return 1
+      fi
+      found_env="$(consensus_pod_wraps_env "${pod}" || true)"
+      found_wraps="$(consensus_pod_wraps_file_count "${pod}" "${wraps_dir}" || true)"
+      if [[ "${found_env}" == "${wraps_dir}" && "${found_wraps}" == "${expected_wraps}" ]]; then
+        ready_for_proof=true
+        break
+      fi
+      sleep 5
+    done
+
+    if ! ${ready_for_proof}; then
+      echo "  ${pod}: timed out waiting for WRAPS env+artifacts (env='${found_env:-unset}' wanted '${wraps_dir}'; artifacts=${found_wraps:-0}/${expected_wraps})" >&2
+      return 1
+    fi
+
+    echo "  ${pod}: env + ${found_wraps} artifacts OK; waiting for 'Constructing (genesis|incremental) WRAPS proof with:' in hgcaa.log"
     local progress_tick=0
     while (( SECONDS < deadline )); do
       if wraps_failure_present_in_log "${pod}"; then
@@ -1491,129 +1510,6 @@ inject_wraps_env_into_statefulsets() {
   done
 }
 
-consensus_node_platform_state() {
-  local pod="$1"
-  kubectl -n "${SOLO_NAMESPACE}" exec "${pod}" -c root-container -- sh -lc \
-    "grep -oE 'HederaNode#[0-9]+ is [A-Z_]+' /opt/hgcapp/services-hedera/HapiApp2.0/output/hgcaa.log 2>/dev/null | tail -1 | awk '{print \$NF}'" 2>/dev/null
-}
-
-# Recovery for a JAR-staging race in `solo consensus network upgrade --local-build-path`:
-# Solo's `Fetch platform software` task `kubectl cp`s the local-build jars into
-# each CN's data/lib, then `Starting nodes` re-execs the JVM almost immediately.
-# Occasionally one or more JVMs start while the JAR files are still settling on
-# disk, and class loading fails with `NoClassDefFoundError: Could not initialize
-# class com.sun.jna.Native` (lazysodium → Ed25519VerificationProvider.<clinit>)
-# or `semantic-version.properties could not be found`. Those JVMs die during
-# startup but the pod itself stays Running (k8s readiness probes don't catch a
-# crashed JVM), so Solo's `Check all nodes are ACTIVE` task spins until its 300
-# attempts run out and Solo exits non-zero with `node 'nodeX' is not ACTIVE`.
-#
-# Related but DIFFERENT: Solo issue https://github.com/hiero-ledger/solo/issues/3923
-# (fixed in PR #4020, shipped in Solo 0.71.0) covers `cannot exec into a container
-# in a completed pod` when uploading wraps files to a pod in Failed phase. That
-# fix is already in the user's Solo 0.73.0 — it does NOT address the JVM-startup
-# vs. local-build-jar race this function works around. Do not delete this
-# function on the assumption "Solo's fixed it"; verify the second race is gone
-# (multiple clean Step 10 runs with no FREEZE_COMPLETE→STARTING transitions) first.
-#
-# Strategy: poll each CN's platform state from hgcaa.log; the only healthy
-# terminal state is ACTIVE. FREEZE_COMPLETE / STARTING / CHECKING / OBSERVING /
-# REPLAYING_EVENTS are transient — if a pod stays there past
-# RECOVER_STABLE_WAIT_SECS, kubectl-delete it. Jars + state live on the PVC, so
-# the new pod boots from a settled disk and the second boot wins.
-recover_stuck_consensus_nodes() {
-  # Optional first arg: "true" if Solo's upgrade just failed, so the first pass
-  # should skip the per-pass wait window — pods that didn't reach ACTIVE for
-  # Solo's own 300-attempt check aren't going to spontaneously transition.
-  # Go straight to identifying + re-rolling stuck pods.
-  local solo_failed="${1:-false}"
-  local max_passes="${RECOVER_MAX_PASSES:-3}"
-  local stable_wait_secs="${RECOVER_STABLE_WAIT_SECS:-180}"
-  local pass=1
-  local node pod state stuck
-  local nodes=()
-  IFS=',' read -r -a nodes <<< "${NODE_ALIASES}"
-
-  if [[ "${solo_failed}" == "true" ]]; then
-    echo "Solo upgrade already failed; skipping the per-pass wait on pass 1 and going straight to re-roll"
-  else
-    echo "Waiting up to ${stable_wait_secs}s for all CNs to reach ACTIVE (max ${max_passes} re-roll passes)"
-  fi
-
-  while (( pass <= max_passes )); do
-    # On pass 1 when solo_failed=true, deadline=SECONDS forces us to skip the
-    # inner wait loop and fall through to the stuck-pod identification block.
-    local deadline=$((SECONDS + stable_wait_secs))
-    if [[ "${solo_failed}" == "true" && ${pass} -eq 1 ]]; then
-      deadline=$SECONDS
-    fi
-    local progress_tick=0
-    while (( SECONDS < deadline )); do
-      local all_active=true
-      local report=()
-      for node in "${nodes[@]}"; do
-        pod="network-${node}-0"
-        state="$(consensus_node_platform_state "${pod}" || true)"
-        report+=("${node}=${state:-unknown}")
-        if [[ "${state}" != "ACTIVE" ]]; then
-          all_active=false
-        fi
-      done
-      if ${all_active}; then
-        echo "All consensus nodes reached ACTIVE on pass ${pass}: ${report[*]}"
-        return 0
-      fi
-      # Every ~30s (3 ticks of 10s), echo a heartbeat so the user can see we
-      # are still alive and waiting, without spamming on every poll.
-      if (( progress_tick % 3 == 0 )); then
-        echo "  ...still waiting (pass ${pass}/${max_passes}, $((SECONDS < deadline ? deadline - SECONDS : 0))s remaining); states: ${report[*]}"
-      fi
-      ((progress_tick++))
-      sleep 10
-    done
-
-    stuck=()
-    local final_report=()
-    for node in "${nodes[@]}"; do
-      pod="network-${node}-0"
-      state="$(consensus_node_platform_state "${pod}" || true)"
-      final_report+=("${node}=${state:-unknown}")
-      if [[ "${state}" != "ACTIVE" ]]; then
-        stuck+=("${pod}")
-      fi
-    done
-
-    if (( ${#stuck[@]} == 0 )); then
-      echo "All consensus nodes reached ACTIVE on pass ${pass}: ${final_report[*]}"
-      return 0
-    fi
-
-    echo "Pass ${pass}/${max_passes}: re-rolling stuck pod(s) [${stuck[*]}]; states=${final_report[*]}"
-    for pod in "${stuck[@]}"; do
-      kubectl -n "${SOLO_NAMESPACE}" delete pod "${pod}" >/dev/null 2>&1 || true
-    done
-
-    echo "  Waiting for re-rolled pods + haproxy to be ready..."
-    wait_for_consensus_pods_ready 600
-    wait_for_haproxy_ready 600
-    sleep 30
-    ((pass++))
-  done
-
-  echo "Some consensus nodes did not reach ACTIVE after ${max_passes} passes" >&2
-  for node in "${nodes[@]}"; do
-    pod="network-${node}-0"
-    state="$(consensus_node_platform_state "${pod}" || true)"
-    echo "  ${pod}: ${state:-unknown}" >&2
-  done
-  return 1
-}
-
-apply_wraps_remedy_to_consensus_nodes() {
-  inject_wraps_env_into_statefulsets
-  recover_stuck_consensus_nodes
-}
-
 run_076_upgrade() {
   # Local nginx server providing the wraps tarball at host.docker.internal:8089.
   # The CN's tss.wrapsProvingKeyDownloadEnabled flow will pull from this URL.
@@ -1647,35 +1543,20 @@ run_076_upgrade() {
     --force
   )
 
-  local solo_rc=0
-  set +e
+  # With hiero-ledger/solo#4440 in place, the upgrade stops the JVMs before
+  # the JAR cp and restarts them after, so the previous JAR-staging race that
+  # forced the stuck-pod recovery dance is gone. We let any non-zero Solo exit
+  # (timeout, deploy validation, ACTIVE check failure) propagate via set -e.
   run_with_spinner "Upgrading consensus network to ${UPGRADE_076_VERSION} (local build, 0.76 properties)" \
     run_command_with_timeout "${SOLO_076_UPGRADE_TIMEOUT_SECS}" "${upgrade_cmd[@]}"
-  solo_rc=$?
-  set -e
 
-  echo "--- Step 10 check 1/5: recover any stuck consensus nodes ---"
-  if (( solo_rc != 0 )); then
-    echo "Solo upgrade returned non-zero (rc=${solo_rc}); skipping pre-wait and going straight to pod re-roll"
-    recover_stuck_consensus_nodes true
-  else
-    echo "Solo upgrade returned success; verifying nodes reached ACTIVE"
-    recover_stuck_consensus_nodes false
-  fi
-
-  echo "--- Step 10 check 2/5: verify local-build version on every consensus node ---"
-  verify_local_build_on_consensus_nodes
-
-  # Solo's `consensus network upgrade` rolls the haproxy deployments via its
-  # chart upgrade but does NOT wait for them to finish rolling — so when Solo
-  # returns, the haproxy pods may still be Terminating/Pending and
-  # svc/haproxy-node1-svc has no endpoints. recover_stuck_consensus_nodes only
-  # waits for haproxy after re-rolling a stuck CN pod; on the happy path
-  # (all 4 ACTIVE on pass 1, no re-roll) it never fires, and the next step
-  # (restart_post_upgrade_port_forwards → kubectl port-forward svc/haproxy-node1-svc)
-  # hits an empty endpoint set and the local port never binds. Wait explicitly.
-  echo "  Waiting for haproxy deployments to finish rolling out (Solo's chart upgrade is async)"
+  echo "--- Step 10 check 1/4: wait for consensus pods + haproxy + verify local-build version ---"
+  # Solo's `consensus network upgrade` rolls haproxy via its chart upgrade but
+  # doesn't wait for the rollout — explicitly wait here so the next port-forward
+  # step finds populated endpoints.
+  wait_for_consensus_pods_ready 600
   wait_for_haproxy_ready 600
+  verify_local_build_on_consensus_nodes
 
   # The TSS ceremony (proof key publication → CRS contribution → adoption →
   # proof construction) stalls without new rounds, and rounds don't advance
@@ -1683,18 +1564,18 @@ run_076_upgrade() {
   # a cryptoCreate to drive consensus forward; otherwise verify_wraps will
   # time out waiting for "Constructing genesis WRAPS proof with:" on a totally
   # idle network.
-  echo "--- Step 10 check 3/5: re-establish CN gRPC + Mirror REST port-forwards ---"
+  echo "--- Step 10 check 2/4: re-establish CN gRPC + Mirror REST port-forwards ---"
   restart_post_upgrade_port_forwards
   echo "  Waiting for Mirror REST to serve /api/v1/blocks on http://127.0.0.1:${MIRROR_REST_LOCAL_PORT} (up to 3m)"
   wait_for_http_ok "http://127.0.0.1:${MIRROR_REST_LOCAL_PORT}/api/v1/blocks?limit=1" 36 5
   echo "  Mirror REST responding"
 
-  echo "--- Step 10 check 4/5: submit cryptoCreate to nudge consensus + confirm mirror sees the new account ---"
+  echo "--- Step 10 check 3/4: submit cryptoCreate to nudge consensus + confirm mirror sees the new account ---"
   export MIRROR_ACCOUNT_WAIT_MS="${MIRROR_ACCOUNT_WAIT_MS:-180000}"
   node "${NODE_SCRIPT}"
 
-  echo "--- Step 10 check 5/5: verify WRAPS runtime + proof construction on every consensus node ---"
-  verify_wraps_on_consensus_nodes 300
+  echo "--- Step 10 check 4/4: verify WRAPS runtime + proof construction on every consensus node ---"
+  verify_wraps_on_consensus_nodes 600
   echo "--- Step 10 all checks passed ---"
 }
 
@@ -3311,12 +3192,12 @@ if should_run_step 10; then
     # WRAPS env + artifacts. Skip the solo upgrade (which would fail against
     # an unhealthy network or be a no-op against an already-upgraded one) and
     # just apply the remedy + verify.
-    log "SKIP_076_SOLO_UPGRADE=true; running WRAPS remedy + verify only (skipping solo network upgrade)"
+    log "SKIP_076_SOLO_UPGRADE=true; re-injecting WRAPS env + verifying only (skipping solo network upgrade)"
     ensure_wraps_proving_key_server
-    apply_wraps_remedy_to_consensus_nodes
+    inject_wraps_env_into_statefulsets
     restart_post_upgrade_port_forwards
     verify_local_build_on_consensus_nodes
-    verify_wraps_on_consensus_nodes 300
+    verify_wraps_on_consensus_nodes 600
   else
     sleep 5
     # Still streaming WRBs but TSS is enabled, force mock signatures
